@@ -84,7 +84,7 @@ bash $V/serve.sh
 st "server started"
 for k in $(seq 1 900); do
   curl -sf -o /dev/null -H "$(hdr)" http://127.0.0.1:$PORT/health && { st "healthy"; break; }
-  [ -d /proc/$(cat $R/server.pid) ] || { st "server died"; exit 1; }
+  [ -d /proc/$(cat $R/server.pid) ] || { st "server died ($(tail -5 $R/server.log 2>/dev/null | tr '\n' ' '))"; exit 1; }
   sleep 1
 done
 VRAM=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits | head -1)

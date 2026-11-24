@@ -829,6 +829,12 @@ class Manager:
             self.state = 'stopping'
             self.cond.notify_all()
         log('start failed: ' + err)
+        if os.environ.get('LLM_KEEP_VM_ON_FAIL') == '1' and load_session():
+            log('LLM_KEEP_VM_ON_FAIL=1: leaving Colab session %s running for inspection' % NAME)
+            with self.cond:
+                self.state = 'off'
+                self.cond.notify_all()
+            return
         self._stop('start failed')
 
     def request_stop(self, reason, only_idle=False):
