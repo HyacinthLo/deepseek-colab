@@ -46,7 +46,7 @@ fetch() {  # $1 = backbone|engram|draft
   python3 $V/jobs.py $1 $M $R/j_$1.json >> $R/fetch.log 2>&1 && python3 $V/pfetch.py $R/j_$1.json --workers $WORKERS --chunk-mb 64 --tag $1 --log $R/fetch.log
 }
 
-{ bash $V/build.sh > $R/llama.log 2>&1 && st "llama.cpp built" || st "llama.cpp build FAILED"; } &
+{ bash $V/build.sh > $R/llama.log 2>&1 && st "llama.cpp built" || st "llama.cpp build FAILED ($(tail -1 $R/build.txt 2>/dev/null))"; } &
 if [ "$UNCENSOR" = 1 ]; then
   if [ "$WEIGHTS" = unsloth ]; then
     { mkdir -p /content/patch && curl -sfL --retry 5 ${HF_HDR:+-H @$HF_HDR} -o /content/patch/abliteration-edit.npz "$ABLIT_URL" \
@@ -75,7 +75,7 @@ dd if=$R/engram_head.bin of=$M/$ENGRAM conv=notrunc status=none
 python3 -I $V/checksizes.py /content/model > $R/sizes.txt 2>&1 && st "sizes ok" || { st "sizes FAILED"; exit 1; }
 if [ "$UNCENSOR" = 1 ]; then
   if [ "$WEIGHTS" = unsloth ]; then
-    python3 -I $V/abliterate.py /content/model /content/patch/abliteration-edit.npz /content/llama/bin/abliterate > $R/patch.log 2>&1 && st "abliteration applied" || { st "abliteration FAILED"; exit 1; }
+    python3 -I $V/abliterate.py /content/model /content/patch/abliteration-edit.npz /content/llama/bin/abliterate > $R/patch.log 2>&1 && st "abliteration applied" || { st "abliteration FAILED ($(tail -1 $R/patch.log 2>/dev/null))"; exit 1; }
   else
     python3 -I $V/applypatch.py /content/model /content/patch >> $R/patch.log 2>&1 && st "uncensored tensors applied" || { st "patch apply FAILED"; exit 1; }
   fi
