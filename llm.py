@@ -1112,7 +1112,7 @@ class Manager:
                 self.request_stop('idle %.1f min' % IDLE_MIN, only_idle=True)
                 if p is not None and p.poll() is not None:
                     self._start_repair()
-            elif st == 'off' and os.path.exists(SESSION) and now - self.last_retry > 60:
+            elif st == 'off' and os.path.exists(SESSION) and now - self.last_retry > 60 and os.environ.get('LLM_KEEP_VM_ON_FAIL') != '1':
                 self.last_retry = now
                 self.request_stop('retrying the stop')
 

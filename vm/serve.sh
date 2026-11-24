@@ -26,6 +26,10 @@ ARGS=(-m "$MODEL_FIRST" -a ds41,ds41-max --host 127.0.0.1 --port $PORT
 [ "$DRAFT" = 1 ] && ARGS+=(-md /mnt/ram/m/dspark.gguf --spec-type draft-dspark --spec-draft-n-max 2 -ngld 99 --spec-draft-n-ubatch 512
   --no-spec-draft-backend-sampling)  # backend draft sampling garbles the second sequence of a shared draft batch
 [ "$MMPROJ" = 1 ] && ARGS+=(--mmproj $MMP)
+if [ "${WEIGHTS:-ista}" = unsloth ]; then
+  python3 -I /content/vm/abliterate.py --patch-template "$MODEL_FIRST" /content/res/chat_template.jinja >> /content/res/patch.log 2>&1 \
+    && ARGS+=(--chat-template-file /content/res/chat_template.jinja)
+fi
 echo "$BIN ${ARGS[*]}" > /content/res/serve_cmd.txt
 cd "$(dirname "$BIN")"
 rm -f /content/res/pin_result /content/res/pin_request

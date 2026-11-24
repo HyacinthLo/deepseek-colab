@@ -120,7 +120,52 @@ def build_plan(model_dir, npz_path):
     return dim, q0, q1, plan
 
 
+def patch_chat_template(gguf_path, out_path):
+    """Extracts tokenizer.chat_template from GGUF and enables numeric string reasoning_effort (e.g. '50')."""
+    with open(gguf_path, 'rb') as f:
+        u = lambda fmt: struct.unpack(fmt, f.read(struct.calcsize(fmt)))[0]
+        s = lambda: f.read(u('<Q'))
+
+        def skip(t):
+            if t == 8:
+                s()
+            elif t == 9:
+                at, n = u('<I'), u('<Q')
+                if at in (8, 9):
+                    for _ in range(n):
+                        skip(at)
+                else:
+                    f.seek(n * SCALAR[at], 1)
+            else:
+                f.seek(SCALAR[t], 1)
+
+        assert u('<I') == 0x46554747, 'not a GGUF file: ' + gguf_path
+        u('<I')
+        _, nkv = u('<Q'), u('<Q')
+        tmpl = None
+        for _ in range(nkv):
+            k = s().decode()
+            t = u('<I')
+            if k == 'tokenizer.chat_template' and t == 8:
+                tmpl = s().decode('utf-8')
+                break
+            skip(t)
+    assert tmpl, 'tokenizer.chat_template not found in ' + gguf_path
+    add = ('{%- elif reasoning_effort is string and (reasoning_effort | int | string) == reasoning_effort '
+           'and (reasoning_effort | int) >= 1 and (reasoning_effort | int) <= 100 -%}\n'
+           '    {%- set budget = reasoning_effort | int -%}\n')
+    anchor = '{%- elif reasoning_effort is integer and reasoning_effort >= 1 and reasoning_effort <= 100 -%}\n    {%- set budget = reasoning_effort -%}\n'
+    if '(reasoning_effort | int | string)' not in tmpl and anchor in tmpl:
+        tmpl = tmpl.replace(anchor, anchor + add, 1)
+    with open(out_path, 'w', encoding='utf-8') as f:
+        f.write(tmpl)
+    print('wrote patched chat template (%d bytes) to %s' % (len(tmpl), out_path))
+
+
 def main():
+    if len(sys.argv) == 4 and sys.argv[1] == '--patch-template':
+        patch_chat_template(sys.argv[2], sys.argv[3])
+        return
     model_dir, npz_path, bin_path = sys.argv[1:4]
     dim, q0, q1, plan = build_plan(model_dir, npz_path)
     with tempfile.TemporaryDirectory(prefix='abliterate-') as td:
