@@ -16,4 +16,7 @@ cmake -S $S -B $S/build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120 -DLLAMA_BU
 nice -n 5 cmake --build $S/build -j 40 --target llama-server > $R/build_make.log 2>&1 || { st "make FAILED: $(grep -m3 -i error $R/build_make.log | tr '\n' ' ')"; exit 1; }
 mkdir -p $D && cp -a $S/build/bin/* $D/ && find $S/build -name "*.so*" -exec cp -a {} $D/ \;
 for l in libcudart.so libcublas.so libcublasLt.so; do cp -a /usr/local/cuda/lib64/$l* $D/ 2>/dev/null; done
+if [ -f /content/vm/abliterate.c ]; then
+  gcc -O3 -fopenmp -I$S/ggml/include /content/vm/abliterate.c -L$D -lggml-base -Wl,-rpath,'$ORIGIN' -lm -o $D/abliterate >> $R/build.txt 2>&1 || { st "abliterate build FAILED"; exit 1; }
+fi
 st "build done"
