@@ -67,8 +67,8 @@ LAYOUTS = {'default': {'UBATCH': '2048', 'MOE_CACHE_MIB': '70430', 'DYN': '110',
 WEIGHT_LAYOUTS = {
     'ista': LAYOUTS,
     'unsloth': {
-        'default': {'UBATCH': '2048', 'MOE_CACHE_MIB': '70200', 'DYN': '110', 'DMA': '1', 'SPEED': '116.5'},
-        'fast': {'UBATCH': '3072', 'MOE_CACHE_MIB': '74000', 'DYN': '166', 'DMA': '1', 'SPEED': '123.1'},
+        'default': {'UBATCH': '2048', 'MOE_CACHE_MIB': '73400', 'DYN': '110', 'DMA': '1', 'SPEED': '118.7'},
+        'fast': {'UBATCH': '3072', 'MOE_CACHE_MIB': '75600', 'DYN': '166', 'DMA': '1', 'SPEED': '123.0'},
     },
 }
 WEIGHT_NAMES = {'ista': 'ISTA IQ2_XXS', 'unsloth': 'Unsloth UD-IQ1_M'}

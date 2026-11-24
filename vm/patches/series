@@ -24,3 +24,6 @@ patch_dmaalign.py
 patch_opt_upstream.py
 patch_opt_dma.py
 patch_opt_shexp_overlap.py
+patch_opt_topk_fuse.py
+patch_opt_qchunk.py
+patch_opt_shexp_fuse.py

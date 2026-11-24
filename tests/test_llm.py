@@ -423,7 +423,7 @@ class ProxyTests(unittest.TestCase):
         lock = json.loads(read(os.path.join(c.state, 'serve.lock')))
         self.assertEqual((lock['detached'], lock['choice'], lock['weights']), (True, [False, 131072], 'unsloth'))
         env = json.loads(read(c.res('boot_check.json')))['env']
-        self.assertEqual((env['WEIGHTS'], env['MOE_CACHE_MIB'], env['DYN'], env['DMA']), ('unsloth', '74000', '166', '1'))
+        self.assertEqual((env['WEIGHTS'], env['MOE_CACHE_MIB'], env['DYN'], env['DMA']), ('unsloth', '75600', '166', '1'))
         mismatch = c.llm('up', '--fast')
         self.assertNotEqual(mismatch.returncode, 0)
         self.assertIn('Unsloth UD-IQ1_M', mismatch.stderr)
@@ -700,11 +700,11 @@ class UnitTests(unittest.TestCase):
         try:
             envs = L.boot_env()
             self.assertIn("WEIGHTS='unsloth'", envs)
-            self.assertIn("MOE_CACHE_MIB='70200'", envs)
+            self.assertIn("MOE_CACHE_MIB='73400'", envs)
             self.assertIn("DMA='1'", envs)
             os.environ['LLM_PROFILE'] = 'fast'
             envs_fast = L.boot_env()
-            self.assertIn("MOE_CACHE_MIB='74000'", envs_fast)
+            self.assertIn("MOE_CACHE_MIB='75600'", envs_fast)
             self.assertIn("DMA='1'", envs_fast)
             del os.environ['LLM_PROFILE']
         finally:
