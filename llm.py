@@ -8,20 +8,21 @@ import hmac, http.client, io, json, os, re, secrets, shlex, shutil, signal, sock
 import threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-USAGE = '''usage: python3 llm.py COMMAND [--fast]
+USAGE = '''usage: python3 llm.py COMMAND [--fast] [--unsloth]
   up            set up on first use, start the GPU and print the endpoint (base URL, API key, models)
   down          stop the GPU and the local endpoint
   status        endpoint state, Colab balance and session
   watch         live view: GPU on or off, idle countdown to the auto-stop, cost so far (up shows it too)
-  settings      change the saved defaults: image input, context, reasoning effort, idle stop, hard stop, uncensored
+  settings      change the saved defaults: weights, image input, context, reasoning effort, idle stop, hard stop, uncensored
   ask TEXT      send one question and stream the answer (--max for reasoning effort max)
   opencode ...  start opencode with this endpoint configured, in any shell; arguments go to opencode
   logs          local log plus the GPU's boot timeline and server log
   setup         install and log in only, start nothing
   serve         run the endpoint in the foreground (Ctrl+C stops the GPU too)
   --fast        this run only: text only, 131K context, the faster layout (118.7 instead of 105.6 tok/s)
+  --unsloth     this run only: Unsloth UD-IQ1_M weights with mrfakename abliteration-edit.npz
 env: LLM_PORT (18080) LLM_IDLE_MIN (10) LLM_MAX_HOURS (6) LLM_MIN_BALANCE (5) LLM_IMAGES (0|1) LLM_CONTEXT (4096-262144)
-     LLM_PROFILE (default|fast presets) LLM_BIND (127.0.0.1)
+     LLM_PROFILE (default|fast presets) LLM_WEIGHTS (ista|unsloth) LLM_BIND (127.0.0.1)
      HF_TOKEN (optional Hugging Face token for the downloads) LLM_YES=1 (answer yes to install prompts) LLM_BOOT_ENV ("K=V ...")
      LLM_SESSION LLM_COLAB LLM_STATE LLM_VM_DIR; tests: LLM_SSH_CMD LLM_TUNNEL_PORT LLM_POLL_S'''
 
@@ -32,7 +33,7 @@ KEY_FILE, SSH_KEY = os.path.join(STATE, 'api_key'), os.path.join(STATE, 'id_ed25
 SESSION, LOCK, LOG = (os.path.join(STATE, f) for f in ('session.json', 'serve.lock', 'llm.log'))
 SETTINGS_FILE = os.path.join(STATE, 'settings.json')
 VM_DIR = os.path.abspath(os.environ.get('LLM_VM_DIR') or os.path.join(ROOT, 'vm'))
-DEFAULTS = {'images': True, 'context': 262144, 'effort': '50', 'idle_min': 10, 'max_hours': 6, 'uncensor': True}
+DEFAULTS = {'weights': 'ista', 'images': True, 'context': 262144, 'effort': '50', 'idle_min': 10, 'max_hours': 6, 'uncensor': True}
 
 
 def load_settings():
@@ -62,8 +63,17 @@ G4_CU_PER_HOUR = 8.9
 # the two GPU memory layouts measured on the G4: 'default' fits images and 262K per request, 'fast' text only up to 131K
 LAYOUTS = {'default': {'UBATCH': '2048', 'MOE_CACHE_MIB': '70430', 'DYN': '110', 'DMA': '0', 'SPEED': '105.6'},
            'fast': {'UBATCH': '3072', 'MOE_CACHE_MIB': '74231', 'DYN': '166', 'DMA': '1', 'SPEED': '118.7'}}
+# Unsloth UD-IQ1_M has +1.43 GB heavier non-routed GPU weights (7.59 vs 6.16 GB) and 5 expert groups instead of 8
+WEIGHT_LAYOUTS = {
+    'ista': LAYOUTS,
+    'unsloth': {
+        'default': {'UBATCH': '2048', 'MOE_CACHE_MIB': '68950', 'DYN': '110', 'DMA': '0', 'SPEED': '105.6'},
+        'fast': {'UBATCH': '3072', 'MOE_CACHE_MIB': '72750', 'DYN': '166', 'DMA': '1', 'SPEED': '118.7'},
+    },
+}
+WEIGHT_NAMES = {'ista': 'ISTA IQ2_XXS', 'unsloth': 'Unsloth UD-IQ1_M'}
 CONTEXTS = {'32k': 32768, '64k': 65536, '128k': 131072, '131k': 131072, '256k': 262144, '262k': 262144}
-BOOT_KEYS = ('CTX', 'UBATCH', 'MMPROJ', 'MOE_CACHE_MIB', 'DYN', 'DMA', 'DRAFT', 'UNCENSOR', 'WORKERS')
+BOOT_KEYS = ('CTX', 'UBATCH', 'MMPROJ', 'MOE_CACHE_MIB', 'DYN', 'DMA', 'WEIGHTS', 'DRAFT', 'UNCENSOR', 'WORKERS')
 VM_PORT = 18080
 NO_WINDOW, DETACHED, NEW_GROUP, BREAKAWAY = 0x08000000, 0x00000008, 0x00000200, 0x01000000
 CHILD_FLAGS = NO_WINDOW if IS_WIN else 0
@@ -72,9 +82,12 @@ HOP = {'connection', 'keep-alive', 'proxy-connection', 'proxy-authorization', 't
        'content-length', 'host', 'accept-encoding', 'expect', 'server', 'date'}
 STEPS = (('encoder', r'image encoder fetched', 'image encoder downloaded (1 GB)'),
          ('patch', r'uncensor patch fetched', 'uncensored tensors downloaded (1.7 GB)'),
+         ('patch', r'abliteration edit fetched', 'abliteration edit downloaded (43 KB)'),
          ('draft', r'draft fetched', 'draft model downloaded (8 GB)'),
-         ('model', r'backbone fetched', 'model downloaded (138 GB)'),
+         ('model', r'backbone fetched \(unsloth\)', 'model downloaded (140 GB)'),
+         ('model', r'backbone fetched$', 'model downloaded (138 GB)'),
          ('build', r'llama\.cpp built', 'llama.cpp built'),
+         ('abliterate', r'abliteration applied', 'abliteration baked into weights'),
          ('loaded', r'healthy', 'model loaded onto the GPU'),
          ('pinned', r'pin: ', 'RAM freed, cold experts pinned'),
          ('engram', r'engram done', 'Engram table loaded (110 GB)'),
@@ -239,12 +252,26 @@ def model_efforts():
     return (('ds41', str(SETTINGS['effort'])), ('ds41-max', 'max'))
 
 
+def weights_value(text):
+    t = (text or '').strip().lower()
+    return t if t in WEIGHT_LAYOUTS else None
+
+
+def weights_choice():
+    raw = os.environ.get('LLM_WEIGHTS') or SETTINGS.get('weights') or 'ista'
+    w = weights_value(raw)
+    if not w:
+        sys.exit('unknown LLM_WEIGHTS %r (use ista or unsloth)' % raw)
+    return w
+
+
 def profile():
-    """Boot values for the chosen images and context; CTX is the total of the 2 request slots."""
+    """Boot values for the chosen images, context and weights; CTX is the total of the 2 request slots."""
     images, context = choice()
-    lay = LAYOUTS[layout(images, context)]
+    w = weights_choice()
+    lay = WEIGHT_LAYOUTS[w][layout(images, context)]
     return {'CTX': str(2 * context), 'UBATCH': lay['UBATCH'], 'MMPROJ': '1' if images else '0', 'MOE_CACHE_MIB': lay['MOE_CACHE_MIB'],
-            'DYN': lay['DYN'], 'DMA': lay['DMA']}
+            'DYN': lay['DYN'], 'DMA': lay['DMA'], 'WEIGHTS': w}
 
 
 COLAB = colab_cmd()
@@ -1409,7 +1436,7 @@ def serve(detached=False):
     if not os.path.exists(KEY_FILE):
         sys.exit('missing %s; run: python3 llm.py setup' % KEY_FILE)
     profile()
-    held = take_lock({'port': PORT, 'detached': detached, 'choice': list(choice())})
+    held = take_lock({'port': PORT, 'detached': detached, 'choice': list(choice()), 'weights': weights_choice()})
     if held:
         sys.exit('llm.py serve is already running (pid %s, port %s)' % (held.get('pid'), held.get('port')))
     try:
@@ -1522,7 +1549,8 @@ def speed_note(images, context):
 
 
 def settings_summary():
-    return ' · '.join((describe(*choice()), 'effort %s' % SETTINGS['effort'], 'idle stop %g min' % IDLE_MIN, 'hard stop %g h' % MAX_HOURS,
+    return ' · '.join((WEIGHT_NAMES[weights_choice()], describe(*choice()), 'effort %s' % SETTINGS['effort'],
+                       'idle stop %g min' % IDLE_MIN, 'hard stop %g h' % MAX_HOURS,
                        'uncensored' if SETTINGS['uncensor'] else 'original model'))
 
 
@@ -1542,6 +1570,7 @@ def choose_settings(force=False):
             return
     print('%s  %s\n' % (paint('Settings', 'bold'), paint('Enter keeps the value in brackets', 'dim')))
     old, new = SETTINGS, dict(SETTINGS)
+    new['weights'] = pick('Weights', 'ista or unsloth', old.get('weights', 'ista'), weights_value)
     new['images'] = pick('Images', 'image input, y or n', 'y' if old['images'] else 'n', yes_no)
     new['context'] = pick('Context', '32K, 64K, 131K or 262K', short_context(context_value(old['context']) or 262144), context_value)
     print('  %s%s' % (' ' * 12, paint(speed_note(new['images'], new['context']), 'dim')))
@@ -1711,9 +1740,11 @@ def write_opencode(port=PORT):
 def endpoint_info(port, bal=None):
     info, me_cmd = profile(), cli()
     rows = (('Base URL', 'http://%s:%d/v1' % (HOST, port)), ('API key', api_key()),
+            ('Weights', WEIGHT_NAMES[info['WEIGHTS']]),
             ('Models', 'ds41 (effort %s) · ds41-max (effort max)' % SETTINGS['effort']),
             ('Context', '%s tokens per request · image input %s · about %s tok/s' % (
-                '{:,}'.format(int(info['CTX']) // 2), 'on' if info['MMPROJ'] == '1' else 'off', LAYOUTS[layout(*choice())]['SPEED'])))
+                '{:,}'.format(int(info['CTX']) // 2), 'on' if info['MMPROJ'] == '1' else 'off',
+                WEIGHT_LAYOUTS[info['WEIGHTS']][layout(*choice())]['SPEED'])))
     print()
     for name, value in rows:
         print('  %-10s %s' % (name, paint(value, 'bold')))
@@ -1743,9 +1774,11 @@ def cmd_up():
     print(paint('DeepSeek V4.1 Flash on Colab', 'bold') + '\n')
     bal = setup()
     held = serve_running()
-    if held and held.get('choice') != list(choice()):
-        sys.exit('The endpoint runs with %s. To change that, stop it first: %s down'
-                 % (describe(*held['choice']) if held.get('choice') else 'other settings', cli()))
+    if held and (held.get('choice') != list(choice()) or held.get('weights', 'ista') != weights_choice()):
+        have = describe(*held['choice']) if held.get('choice') else 'other settings'
+        if held.get('weights'):
+            have = WEIGHT_NAMES.get(held['weights'], held['weights']) + ' · ' + have
+        sys.exit('The endpoint runs with %s. To change that, stop it first: %s down' % (have, cli()))
     if bal < MIN_BALANCE and not (held and load_session()):
         sys.exit('Colab balance %.2f compute units is below LLM_MIN_BALANCE %.0f' % (bal, MIN_BALANCE))
     if not held:
@@ -1923,6 +1956,10 @@ def main():
         sys.stdout.reconfigure(errors='replace')
     if '--fast' in args and cmd not in ('ask', 'opencode'):
         os.environ['LLM_PROFILE'] = CHILD_ENV['LLM_PROFILE'] = 'fast'
+    if '--unsloth' in args and cmd not in ('ask', 'opencode'):
+        os.environ['LLM_WEIGHTS'] = CHILD_ENV['LLM_WEIGHTS'] = 'unsloth'
+    elif '--ista' in args and cmd not in ('ask', 'opencode'):
+        os.environ['LLM_WEIGHTS'] = CHILD_ENV['LLM_WEIGHTS'] = 'ista'
     os.makedirs(STATE, mode=0o700, exist_ok=True)
     init_console()
     commands = {'up': cmd_up, 'down': lambda: cmd_down('--all' in args), 'status': cmd_status, 'logs': cmd_logs, 'setup': cmd_setup,

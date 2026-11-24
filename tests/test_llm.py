@@ -413,6 +413,25 @@ class ProxyTests(unittest.TestCase):
         c.wait(lambda: not procs_with(c.dir, '--detached'), 10)
         c.assert_all_stopped(self)
 
+    def test_07d_unsloth_weights_flow(self):
+        c = Case(self)
+        r = c.llm('up', '--unsloth', '--fast')
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        for line in ('abliteration edit downloaded (43 KB)', 'model downloaded (140 GB)',
+                     'abliteration baked into weights', 'Weights    Unsloth UD-IQ1_M'):
+            self.assertIn(line, r.stdout)
+        lock = json.loads(read(os.path.join(c.state, 'serve.lock')))
+        self.assertEqual((lock['detached'], lock['choice'], lock['weights']), (True, [False, 131072], 'unsloth'))
+        env = json.loads(read(c.res('boot_check.json')))['env']
+        self.assertEqual((env['WEIGHTS'], env['MOE_CACHE_MIB'], env['DYN'], env['DMA']), ('unsloth', '72750', '166', '1'))
+        mismatch = c.llm('up', '--fast')
+        self.assertNotEqual(mismatch.returncode, 0)
+        self.assertIn('Unsloth UD-IQ1_M', mismatch.stderr)
+        self.assertEqual(c.req().status, 200)
+        self.assertEqual(c.llm('down').returncode, 0)
+        c.wait(lambda: not procs_with(c.dir, '--detached'), 10)
+        c.assert_all_stopped(self)
+
     def test_08_lock_blocks_second_serve(self):
         c = Case(self)
         p = c.serve()
@@ -673,6 +692,78 @@ class UnitTests(unittest.TestCase):
         p.wait()
         p.stderr.close()
         self.assertEqual(hits, [1])
+
+    def test_unsloth_layouts_jobs_and_abliterate_plan(self):
+        import struct, zipfile
+        L = self.llm
+        os.environ['LLM_WEIGHTS'] = 'unsloth'
+        try:
+            envs = L.boot_env()
+            self.assertIn("WEIGHTS='unsloth'", envs)
+            self.assertIn("MOE_CACHE_MIB='68950'", envs)
+            self.assertIn("DMA='0'", envs)
+            os.environ['LLM_PROFILE'] = 'fast'
+            envs_fast = L.boot_env()
+            self.assertIn("MOE_CACHE_MIB='72750'", envs_fast)
+            self.assertIn("DMA='1'", envs_fast)
+            del os.environ['LLM_PROFILE']
+        finally:
+            os.environ.pop('LLM_WEIGHTS', None)
+            os.environ.pop('LLM_PROFILE', None)
+
+        # Verify vm/jobs.py generates 4 UD-IQ1_M backbone shards + 1 Engram shard + DSpark draft
+        for what, want_n in (('backbone', 4), ('engram', 1), ('draft', 1)):
+            out = os.path.join(self.dir, 'jobs_%s.json' % what)
+            r = subprocess.run([PY, '-B', os.path.join(VM_DIR, 'jobs.py'), what, '/mnt/ram/m', out],
+                               env=dict(clean_env(), WEIGHTS='unsloth'), capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            items = json.loads(read(out))
+            self.assertEqual(len(items), want_n)
+            if what != 'draft':
+                self.assertIn('UD-IQ1_M', items[0]['url'])
+
+        # Verify vm/abliterate.py parses Fortran-order Q.npy, scales.npy, and GGUF offsets accurately
+        sys.path.insert(0, VM_DIR)
+        try:
+            ab = importlib.import_module('abliterate')
+            dim = 4
+            def npy(shape, fortran, vals):
+                hdr = ("{'descr': '<f4', 'fortran_order': %s, 'shape': %r, }" % (fortran, shape)).encode()
+                pad = (64 - (10 + len(hdr) + 1) % 64) % 64
+                hdr = hdr + b' ' * pad + b'\n'
+                return b'\x93NUMPY\x01\x00' + struct.pack('<H', len(hdr)) + hdr + struct.pack('<%df' % len(vals), *vals)
+            npz_path = os.path.join(self.dir, 'edit.npz')
+            with zipfile.ZipFile(npz_path, 'w') as zf:
+                # Fortran-order (4, 2): col0 = [1,0,0,0], col1 = [0,1,0,0]
+                zf.writestr('Q.npy', npy((dim, 2), True, [1, 0, 0, 0, 0, 1, 0, 0]))
+                # C-order (2, 2): layer 0 attn=0.5 shexp=0.0; layer 1 attn=0.0 shexp=0.75
+                zf.writestr('scales.npy', npy((2, 2), False, [0.5, 0.0, 0.0, 0.75]))
+            d, q0, q1, scales = ab.load_edit_npz(npz_path)
+            self.assertEqual((d, q0, q1), (4, [1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]))
+            self.assertEqual(scales, [(0.5, 0.0), (0.0, 0.75)])
+
+            mdir = os.path.join(self.dir, 'gguf_ab')
+            os.makedirs(mdir, exist_ok=True)
+            gpath = os.path.join(mdir, 'shard-00001-of-00001.gguf')
+            tdefs = [('blk.0.attn_output_b.weight', [256, dim], 14, 210 * dim),
+                     ('blk.1.ffn_down_shexp.weight', [256, dim], 13, 176 * dim)]
+            hdr = bytearray(struct.pack('<IIQQ', 0x46554747, 3, len(tdefs), 0))
+            off = 0
+            for name, dims, gt, nb in tdefs:
+                b = name.encode()
+                hdr += struct.pack('<Q', len(b)) + b + struct.pack('<I', len(dims))
+                for x in dims:
+                    hdr += struct.pack('<Q', x)
+                hdr += struct.pack('<IQ', gt, off)
+                off += (nb + 31) // 32 * 32
+            hdr += b'\x00' * (((len(hdr) + 31) // 32 * 32) - len(hdr))
+            with open(gpath, 'wb') as f:
+                f.write(hdr + b'\x00' * off)
+            _, _, _, plan = ab.build_plan(mdir, npz_path)
+            self.assertEqual([(p[1], p[2], p[7]) for p in plan],
+                             [('blk.0.attn_output_b.weight', 14, 0.5), ('blk.1.ffn_down_shexp.weight', 13, 0.75)])
+        finally:
+            sys.path.remove(VM_DIR)
 
 
 if __name__ == '__main__':

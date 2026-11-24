@@ -17,10 +17,10 @@ def st(msg):
 def main():
     with open(os.path.join(R, 'boot.pgid'), 'w') as f:
         f.write(str(os.getpgid(0)))
-    env = {k: v for k, v in os.environ.items() if k in ('CTX', 'UBATCH', 'MMPROJ', 'MOE_CACHE_MIB', 'DYN', 'DRAFT', 'UNCENSOR') or k.startswith('X_')}
+    env = {k: v for k, v in os.environ.items() if k in ('WEIGHTS', 'CTX', 'UBATCH', 'MMPROJ', 'MOE_CACHE_MIB', 'DYN', 'DMA', 'DRAFT', 'UNCENSOR') or k.startswith('X_')}
     env['FAKE_MODE'] = MODE
     files = [os.path.relpath(os.path.join(d, f), C) for d, _, fs in os.walk(V) for f in fs]
-    want = ['secrets/key', 'vm/libpin.so', 'vm/boot.sh', 'vm/serve.sh', 'vm/build.sh', 'vm/patches/series']
+    want = ['secrets/key', 'vm/libpin.so', 'vm/boot.sh', 'vm/serve.sh', 'vm/build.sh', 'vm/abliterate.c', 'vm/abliterate.py', 'vm/patches/series']
     check = {'missing': [p for p in want if not os.path.exists(os.path.join(C, p))],
              'crlf': [f for f in files + ['secrets/key'] if b'\r' in open(os.path.join(C, f), 'rb').read()],
              'secrets': sorted(os.listdir(os.path.join(C, 'secrets'))),
@@ -34,7 +34,14 @@ def main():
         st('backbone FAILED')
         st('fetch FAILED, stopping')
         return 1
-    st('backbone fetched')
+    if env.get('WEIGHTS') == 'unsloth':
+        if env.get('UNCENSOR', '1') == '1':
+            st('abliteration edit fetched')
+        st('backbone fetched (unsloth)')
+        if env.get('UNCENSOR', '1') == '1':
+            st('abliteration applied')
+    else:
+        st('backbone fetched')
     port = os.environ['FAKE_VM_INNER_PORT']
     with open(os.path.join(R, 'server.log'), 'w') as log:
         p = subprocess.Popen([sys.executable, os.path.join(TESTS, 'mock_llama.py'), port, '0.5'],

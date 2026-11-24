@@ -19,7 +19,7 @@ app --HTTP--> llm.py on 127.0.0.1:18080 --SSH tunnel (colab ssh --proxy-mode)-->
 | Command | Effect | Costs money? |
 | --- | --- | --- |
 | `python3 llm.py setup` | installs the CLI (asks), Google login, keys, `state/opencode.json` | no |
-| `python3 llm.py up [--fast]` | setup if needed, starts the GPU, prints base URL, API key, models; in a human terminal it then stays in a live view until Ctrl+C | **yes, about 9 compute units per hour until stopped** |
+| `python3 llm.py up [--fast] [--unsloth]` | setup if needed, starts the GPU, prints base URL, API key, models; in a human terminal it then stays in a live view until Ctrl+C (`--unsloth` uses Unsloth `UD-IQ1_M` + mrfakename `abliteration-edit.npz`) | **yes, about 9 compute units per hour until stopped** |
 | `python3 llm.py status` | endpoint state, Colab balance, session, base URL and key | no |
 | `python3 llm.py watch` | live view for a human terminal (countdown to the auto-stop, cost so far) | no |
 | `python3 llm.py settings` | asks for the saved defaults (image input, context, effort, idle stop, hard stop, uncensored) | no |
@@ -89,7 +89,8 @@ These were measured on the G4 at reasoning effort max, one answer stream at a ti
 | `vm/serve.sh` | llama-server flags and the runtime switches of the patches |
 | `vm/build.sh`, `vm/patches/` | llama.cpp b11963 at a pinned commit, with the patch series |
 | `vm/jobs.py`, `vm/pfetch.py` | download jobs at pinned Hugging Face revisions, parallel range fetcher |
-| `vm/mkpatch.py`, `vm/applypatch.py` | builds and applies the uncensor splice (sha256 checked) |
+| `vm/mkpatch.py`, `vm/applypatch.py` | builds and applies the AtomicChat uncensor splice for `ista` (sha256 checked) |
+| `vm/abliterate.py`, `vm/abliterate.c` | bakes mrfakename `abliteration-edit.npz` in place for `unsloth` (`Q6_K`/`Q5_K`/`Q8_0` fixed-scale stochastic rounding via `libggml-base`) |
 | `vm/punch.py`, `vm/pin.c` | frees RAM the GPU already holds; pins cold experts for DMA |
 | `vm/gate.py` | opens the public port only when everything is loaded |
 | `vm/profile-IQ2_XXS.txt` | expert hotness order used to fill the GPU cache |

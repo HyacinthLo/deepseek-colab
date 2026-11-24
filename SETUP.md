@@ -53,6 +53,7 @@ From then on, `up` shows your settings in one line: Enter starts, `c` changes th
 | --- | --- |
 | `python3 llm.py up` | Set up if needed, start the GPU, wait until it serves, print base URL, API key and models, then show the live status (Ctrl+C closes the view). The endpoint keeps running in the background. |
 | `python3 llm.py up --fast` | Same, for this run text only with 131K context: the faster layout, about 12% faster decode. |
+| `python3 llm.py up --unsloth` | Same, for this run using Unsloth `UD-IQ1_M` weights with mrfakename `abliteration-edit.npz` baked in place (combinable with `--fast`). |
 | `python3 llm.py down` | Stop the GPU and the background endpoint. |
 | `python3 llm.py status` | Endpoint state, Colab balance and session, base URL and key. |
 | `python3 llm.py watch` | The live status again: GPU running or off, countdown to the automatic stop, cost so far. |
@@ -118,12 +119,13 @@ The first `up` asks for these and saves them in `state/settings.json`; `python3 
 
 | Setting | Default | Choices |
 | --- | --- | --- |
+| Weights | `ista` | `ista` (ISTA-DASLab `IQ2_XXS` + AtomicChat splice) or `unsloth` (Unsloth `UD-IQ1_M` + mrfakename `abliteration-edit.npz` baked in place) |
 | Images | on | image input on or off |
 | Context | 262K | tokens per request: 32K, 64K, 131K, 262K or any number from 4,096 to 262,144. Text only up to 131K runs on the faster measured memory layout (118.7 tok/s); everything else on the 262K-with-images layout (105.6 tok/s). A smaller context works but is not faster, because only these two layouts are measured. |
 | Reasoning effort of `ds41` | 50 | 1-100, `low` (50), `high` (75) or `max`. `ds41-max` always uses max. A request's own `reasoning_effort` wins. |
 | Idle stop | 10 minutes | 1-120 minutes without requests, then the GPU stops |
 | Hard stop | 6 hours | 1-24 hours, then the GPU stops whatever happens |
-| Uncensored | yes | no = ISTA-DASLab's original tensors |
+| Uncensored | yes | no = original tensors without uncensor/abliteration edit |
 
 Without a terminal (scripts, agents) nothing is asked and the saved values or defaults apply. Environment variables override the saved values for one run, for example `LLM_IDLE_MIN=30 python3 llm.py up`:
 
@@ -136,6 +138,7 @@ Without a terminal (scripts, agents) nothing is asked and the saved values or de
 | `LLM_IMAGES` | saved | `1` image input on, `0` off |
 | `LLM_CONTEXT` | saved | tokens per request, 4096-262144, or 32K, 64K, 131K, 262K |
 | `LLM_PROFILE` | unset | presets: `default` (images, 262K) or `fast` (text only, 131K, same as `--fast`) |
+| `LLM_WEIGHTS` | saved | weight source: `ista` (default) or `unsloth` (same as `--unsloth`) |
 | `LLM_BIND` | 127.0.0.1 | listen address (see "Other devices") |
 | `HF_TOKEN` | none | your Hugging Face token, if anonymous downloads get rate-limited; sent only to the VM, deleted at stop |
 | `UNCENSOR` | saved | `0` serves ISTA-DASLab's original (censored) tensors |
