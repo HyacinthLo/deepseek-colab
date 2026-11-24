@@ -8,6 +8,8 @@ export PIN=1 PIN_MAPPED=1 CACHE_RAM=1024 LLAMA_MOE_PAD_ZERO=1 LLAMA_MOE_CACHE_PI
 export LLAMA_MOE_CACHE_PROFILE=/content/vm/profile-$RUNG.txt LLAMA_MOE_CACHE_RESIDENT=/content/res/resident.txt
 export CPU_RE=$(python3 -c "print(r'blk\.(%s)\.ffn_(up|gate|down)_exps\.weight=CPU' % '|'.join(map(str, range(40))))")
 [ -s /content/secrets/hf_hdr ] && export HF_HDR=/content/secrets/hf_hdr
+M=/mnt/ram/m; R=/content/res; V=/content/vm
+mkdir -p $R /mnt/ram /content/model /content/llama
 if [ "$WEIGHTS" = unsloth ]; then
   HF=https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF/resolve/dfcee0ec8d6b874c6663eca0fc55d90ab32534c8/UD-IQ1_M
   NAME=DeepSeek-V4.1-Flash-1017-UD-IQ1_M
@@ -25,14 +27,12 @@ elif [ "$WEIGHTS" = ista ]; then
   PUNCH_GLOB="$M/$NAME-0000[2-5]-of-00006.gguf"
   BACKBONE_MSG="backbone fetched"
 else
-  mkdir -p /content/res && echo "unknown WEIGHTS=$WEIGHTS FAILED" >> /content/res/timeline.txt; exit 1
+  echo "unknown WEIGHTS=$WEIGHTS FAILED" >> $R/timeline.txt; exit 1
 fi
 export MODEL_FIRST=/content/model/$NAME-00001-of-0000$NSHARDS.gguf
 ABLIT_URL=https://huggingface.co/mrfakename/DeepSeek-V4.1-Flash-1017-abliterated/resolve/4433164758a8045b1b915b7644cce97b9a0e274c/abliteration-edit.npz
 ABLIT_SHA=83273cdbe06e65ad2852dd09e8d976a0e8ce3209788938add325989c20b63b02
 DRAFT_SHA=6ba6ac1b331c540691a209e7fc97dec2a24e295acb1e755c84c7d24a4373927a
-M=/mnt/ram/m; R=/content/res; V=/content/vm
-mkdir -p $R /mnt/ram /content/model /content/llama
 rm -f $R/resident.txt $R/READY
 T0=$(date +%s)
 st() { echo "$(( $(date +%s) - T0 ))s $(date +%T) $*" >> $R/timeline.txt; }
