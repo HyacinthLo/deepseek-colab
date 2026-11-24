@@ -67,8 +67,8 @@ LAYOUTS = {'default': {'UBATCH': '2048', 'MOE_CACHE_MIB': '70430', 'DYN': '110',
 WEIGHT_LAYOUTS = {
     'ista': LAYOUTS,
     'unsloth': {
-        'default': {'UBATCH': '2048', 'MOE_CACHE_MIB': '68950', 'DYN': '110', 'DMA': '0', 'SPEED': '105.6'},
-        'fast': {'UBATCH': '3072', 'MOE_CACHE_MIB': '72750', 'DYN': '166', 'DMA': '1', 'SPEED': '118.7'},
+        'default': {'UBATCH': '2048', 'MOE_CACHE_MIB': '70200', 'DYN': '110', 'DMA': '0', 'SPEED': '105.6'},
+        'fast': {'UBATCH': '3072', 'MOE_CACHE_MIB': '74000', 'DYN': '166', 'DMA': '1', 'SPEED': '118.7'},
     },
 }
 WEIGHT_NAMES = {'ista': 'ISTA IQ2_XXS', 'unsloth': 'Unsloth UD-IQ1_M'}
@@ -1063,10 +1063,12 @@ class Manager:
             s = self.sess or load_session() or {'name': NAME}
             reason = 'session gone'
             if session_alive():
-                reason = 'tunnel failed 3 times'
-                for attempt in range(3):
+                reason = 'tunnel failed 6 times'
+                for attempt in range(6):
                     if self.state != 'ready':
                         return
+                    if attempt:
+                        time.sleep(min(20.0, POLL_S * attempt))
                     if self._tunnel_up(s):
                         with self.cond:
                             self.tunnel_ok = True
