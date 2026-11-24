@@ -17,12 +17,11 @@ def st(msg):
 def main():
     with open(os.path.join(R, 'boot.pgid'), 'w') as f:
         f.write(str(os.getpgid(0)))
-    env = {k: v for k, v in os.environ.items() if k in ('ENGINE', 'QUANT', 'CTX', 'UBATCH', 'MMPROJ', 'MOE_CACHE_MIB', 'DYN', 'DMA', 'VRAM_RESERVE', 'RAM_BUDGET', 'DRAFT', 'UNCENSOR') or k.startswith('X_')}
+    env = {k: v for k, v in os.environ.items() if k in ('MODEL_ALIAS', 'CTX', 'MMPROJ', 'VRAM_RESERVE', 'RAM_BUDGET', 'DRAFT', 'UNCENSOR', 'MAX_HOURS', 'CONV_CACHE_MIB') or k.startswith('X_')}
     env['FAKE_MODE'] = MODE
     files = [os.path.relpath(os.path.join(d, f), C) for d, _, fs in os.walk(V) for f in fs]
-    want = ['secrets/key', 'vm/libpin.so', 'vm/boot.sh', 'vm/serve.sh', 'vm/build.sh',
-            'vm/boot_basalt.sh', 'vm/serve_basalt.sh', 'vm/build_basalt.sh', 'vm/patch_basalt.py',
-            'vm/basalt_jobs.py', 'vm/abliterate_basalt.py', 'vm/abliterate.c', 'vm/patches/series']
+    want = ['secrets/key', 'vm/boot.sh', 'vm/serve.sh', 'vm/build.sh', 'vm/patch_basalt.py',
+            'vm/basalt_jobs.py', 'vm/abliterate_basalt.py', 'vm/abliterate.c', 'vm/pfetch.py', 'vm/gate.py']
     check = {'missing': [p for p in want if not os.path.exists(os.path.join(C, p))],
              'crlf': [f for f in files + ['secrets/key'] if b'\r' in open(os.path.join(C, f), 'rb').read()],
              'secrets': sorted(os.listdir(os.path.join(C, 'secrets'))),
@@ -30,23 +29,18 @@ def main():
              'vm_files': sorted(files), 'env': env}
     with open(os.path.join(R, 'boot_check.json'), 'w') as f:
         json.dump(check, f)
-    st('boot start fake mode=%s' % MODE)
+    st('boot start engine=basalt model=%s mode=%s' % (env.get('MODEL_ALIAS', 'DeepSeek-V4.1-Flash-1017-UD-IQ1_M'), MODE))
     time.sleep(BOOT_S / 2)
     if MODE == 'fail':
         st('backbone FAILED')
-        st('fetch FAILED, stopping')
+        st('fetch/build FAILED, stopping')
         return 1
-    if env.get('ENGINE') == 'basalt':
-        st('basalt built')
-        if env.get('UNCENSOR', '1') == '1':
-            st('abliteration edit fetched')
-        st('backbone fetched (basalt %s)' % env.get('QUANT', 'iq1_m'))
-        if env.get('UNCENSOR', '1') == '1':
-            st('abliteration applied')
-        st('weights loaded')
-        st('pin: VRAM 92000 MiB, model 1.7G')
-    else:
-        st('backbone fetched')
+    st('basalt built')
+    if env.get('UNCENSOR', '1') == '1':
+        st('abliteration edit fetched')
+    st('backbone fetched (basalt iq1_m)')
+    if env.get('UNCENSOR', '1') == '1':
+        st('abliteration applied')
     port = os.environ['FAKE_VM_INNER_PORT']
     with open(os.path.join(R, 'server.log'), 'w') as log:
         p = subprocess.Popen([sys.executable, os.path.join(TESTS, 'mock_llama.py'), port, '0.5'],
@@ -59,7 +53,7 @@ def main():
         try:
             with urllib.request.urlopen('http://127.0.0.1:%s/health' % port, timeout=2) as r:
                 if r.status == 200:
-                    st('basalt http ready' if env.get('ENGINE') == 'basalt' else 'healthy')
+                    st('basalt http ready')
                     break
         except OSError:
             pass
@@ -67,6 +61,9 @@ def main():
             st('server died')
             return 1
         time.sleep(0.2)
+    st('weights loaded')
+    st('pin: VRAM 95727 MiB, model 1.6G')
+    st('engram done')
     time.sleep(BOOT_S / 2)
     open(os.path.join(R, 'READY'), 'w').close()
     with open(os.path.join(R, 'first_token_at'), 'w') as f:

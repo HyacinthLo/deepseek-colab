@@ -1,19 +1,43 @@
 #!/bin/bash
-# Builds llama.cpp b11963 for the G4 (sm_120) with the patches in patches/series into /content/llama/bin, about 2 minutes.
+# Builds patched jesdga95/basalt v0.5.7 (-DBASALT_MODELS=deepseek41) for Colab G4 (sm_120)
+# plus standalone abliterate (zero llama.cpp dependency), ~75 seconds.
 set -uo pipefail
-COMMIT=39febd2adb947b70da35e95f9351b3bf58ad170a
-R=/content/res; P=/content/vm/patches; S=/content/src/llama.cpp; D=/content/llama/bin
+TAG=v0.5.7
+COMMIT=400b411c58031d064812ea21a259b2381acdaa3e
+R=/content/res; V=/content/vm; S=/content/src/basalt; D=/content/basalt
 st() { echo "$(date +%T) $*" >> $R/build.txt; }
-st "build start"
+mkdir -p $R /content/src $D
+st "basalt build start"
 command -v cmake > /dev/null || pip install -q cmake > $R/build_cmake.log 2>&1
-mkdir -p /content/src
-[ -d $S/.git ] || git clone -q --depth 1 --branch b11963 https://github.com/ggml-org/llama.cpp.git $S || { st "clone FAILED"; exit 1; }
-[ "$(git -C $S rev-parse HEAD)" = "$COMMIT" ] || { st "commit mismatch $(git -C $S rev-parse HEAD) FAILED"; exit 1; }
-for p in $(grep -v '^#' $P/series); do python3 $P/$p $S >> $R/build.txt 2>&1 || { st "patch $p FAILED"; exit 1; }; done
-export PATH=/usr/local/cuda/bin:$PATH
-cmake -S $S -B $S/build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120 -DLLAMA_BUILD_TESTS=ON -DLLAMA_CURL=OFF -DLLAMA_OPENSSL=ON \
-  -DCMAKE_BUILD_TYPE=Release > $R/build_cmake.log 2>&1 || { st "cmake FAILED: $(tail -3 $R/build_cmake.log | tr '\n' ' ')"; exit 1; }
-nice -n 5 cmake --build $S/build -j 40 --target llama-server > $R/build_make.log 2>&1 || { st "make FAILED: $(grep -m3 -i error $R/build_make.log | tr '\n' ' ')"; exit 1; }
-mkdir -p $D && cp -a $S/build/bin/* $D/ && find $S/build -name "*.so*" -exec cp -a {} $D/ \;
-for l in libcudart.so libcublas.so libcublasLt.so; do cp -a /usr/local/cuda/lib64/$l* $D/ 2>/dev/null; done
-st "build done"
+if [ ! -d $S/.git ]; then
+  git clone -q --depth 1 --branch $TAG https://github.com/jesdga95/basalt.git $S || { st "basalt clone FAILED"; exit 1; }
+fi
+[ "$(git -C $S rev-parse HEAD)" = "$COMMIT" ] || { st "basalt commit mismatch $(git -C $S rev-parse HEAD) FAILED"; exit 1; }
+python3 $V/patch_basalt.py $S >> $R/build.txt 2>&1 || { st "basalt patch FAILED"; exit 1; }
+if [ -n "${BASALT_PREBUILT_URL:-}" ]; then
+  mkdir -p "$S/bin"
+  if curl -sfL --retry 3 -o "$S/bin/basalt" "$BASALT_PREBUILT_URL" \
+    && { [ -z "${BASALT_PREBUILT_SHA256:-}" ] || sha256sum "$S/bin/basalt" | grep -q "^$BASALT_PREBUILT_SHA256"; } \
+    && chmod +x "$S/bin/basalt" && "$S/bin/basalt" --help > /dev/null 2>&1; then
+    st "basalt prebuilt binary fetched"
+  else
+    rm -f "$S/bin/basalt"
+    st "basalt prebuilt unavailable, falling back to source build"
+  fi
+fi
+if [ ! -x "$S/bin/basalt" ]; then
+  for cand in /usr/local/cuda-13.2/bin /usr/local/cuda-13.1/bin /usr/local/cuda-13.0/bin /usr/local/cuda/bin; do
+    [ -x "$cand/nvcc" ] && { export PATH="$cand:$PATH"; break; }
+  done
+  cmake -S $S -B $S/build -DCMAKE_BUILD_TYPE=Release -DBASALT_MODELS=deepseek41 -DBUILD_TESTING=OFF \
+    > $R/build_cmake.log 2>&1 || { st "basalt cmake FAILED: $(tail -3 $R/build_cmake.log | tr '\n' ' ')"; exit 1; }
+  JOBS=$(nproc); [ "$JOBS" -gt 16 ] && JOBS=16
+  nice -n 5 cmake --build $S/build -j "$JOBS" --target basalt \
+    > $R/build_make.log 2>&1 || { st "basalt make FAILED: $(grep -m3 -i error $R/build_make.log | tr '\n' ' ')"; exit 1; }
+fi
+pip install -q -r $S/requirements.txt > $R/build_pip.log 2>&1 || { st "basalt pip FAILED"; exit 1; }
+if [ -f $V/abliterate.c ]; then
+  gcc -O3 -fopenmp -DABLITERATE_STANDALONE $V/abliterate.c -lm -o $D/abliterate \
+    >> $R/build.txt 2>&1 || { st "standalone abliterate build FAILED"; exit 1; }
+fi
+st "basalt build done"

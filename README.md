@@ -1,101 +1,120 @@
 <div align="center">
 
-<h1>DeepSeek V4.1 Flash on one Colab GPU</h1>
+<h1>DeepSeek V4.1 Flash on Colab G4 (Basalt Native)</h1>
 
-<p><b>The uncensored 249 GB model as your own OpenAI-compatible endpoint, at over 100 tokens a second.</b><br>
-One command, one Google Colab G4, no server of your own.<br>
-Runs on a Google AI Pro subscription: 200 compute units every month, about 9 per hour of use.</p>
-
-https://github.com/user-attachments/assets/6ab03b08-6992-4fc6-8d6a-9c809c8c6336
+<p><b>Uncensored DeepSeek-V4.1-Flash (UD-IQ1_M) on a single Google Colab G4 (RTX PRO 6000 96 GB), powered by Basalt v0.5.7.</b><br>
+150–190+ tok/s solo · 159 tok/s 2-stream concurrent · 262K elastic FP8 KV · 32 GiB Disk Conversation Cache · Dynamic Vision.<br>
+OpenAI Chat &amp; Responses, Anthropic Messages, Claude Code, Codex CLI, opencode, and Basalt Web UI — all behind one local endpoint.</p>
 
 </div>
 
 ## Quick start
 
-You need a Google AI Pro subscription (200 Colab compute units a month) or Colab Pro (100 a month), Python 3.9 or newer and an SSH client. It runs on Linux, macOS and Windows (PowerShell or cmd; type `python` if `python3` is not found).
+Requires Python 3.9+, an OpenSSH client, and a Google AI Pro (200 CU/month) or Colab Pro (100 CU/month) subscription. Runs on Linux, macOS, and Windows.
 
 ```bash
-git clone https://github.com/leonxger/deepseek-colab.git deepseek-colab && cd deepseek-colab
+git clone -b basalt-native https://github.com/HyacinthLo/deepseek-colab.git deepseek-colab && cd deepseek-colab
 python3 llm.py up
 ```
 
-The first run offers to install Google's Colab CLI, walks you through the Google login and asks for a few defaults (image input, context size, reasoning effort, idle stop; Enter keeps each one). Then it starts a G4 GPU and shows each step until your endpoint is ready:
+The first run installs `google-colab-cli`, completes one-time Google OAuth login, lets you confirm defaults, and boots a Colab G4 in **~3 minutes**:
 
 ```text
-Starting a Colab G4 GPU · about 4 minutes
+Starting a Colab G4 GPU · about 2-3 minutes
 
-   0:06  ✓  G4 GPU allocated
-   0:12  ✓  image encoder downloaded (1 GB)
-   0:19  ✓  draft model downloaded (8 GB)
-   0:21  ✓  uncensored tensors downloaded (1.7 GB)
-   0:55  ✓  model downloaded (138 GB)
-   2:19  ✓  llama.cpp built
-   2:34  ✓  model loaded onto the GPU
-   2:41  ✓  RAM freed, cold experts pinned
-   3:22  ✓  Engram table loaded (110 GB)
-   3:23  ✓  warmup answer done
+   0:11  ✓  G4 GPU allocated
+   1:08  ✓  model downloaded (Basalt UD-IQ1_M)
+   1:39  ✓  Basalt v0.5.7 built
+   1:41  ✓  abliteration baked into weights (62/62)
+   1:59  ✓  model loaded onto GPU + RAM
+   2:00  ✓  tmpfs RAM punched & reclaimed
+   2:33  ✓  Engram table loaded (110.6 GB)
+   2:34  ✓  warmup answer done
 
-✓ Ready after 3:24
+✓ Ready after 2:59
 
+  Web UI     http://127.0.0.1:18080/
   Base URL   http://127.0.0.1:18080/v1
-  API key    sk-ds41-3f9c...
-  Models     ds41 (effort 50) · ds41-max (effort max)
-  Context    262,144 tokens per request · image input on · about 105.6 tok/s
+  API key    sk-ds41-...
+  Model      DeepSeek-V4.1-Flash-1017-UD-IQ1_M (effort 50)
+  Context    262,144 tokens/slot (2 slots) · dynamic vision on · ~160.4 tok/s
 
   Try it     python3 llm.py ask "Hello!"
+  Claude     python3 llm.py claude
+  Codex      python3 llm.py codex
   opencode   python3 llm.py opencode [project folder]
+  Shell env  eval "$(python3 llm.py env)"
   Stop       python3 llm.py down
 
-  ● GPU running   idle 2:13 · stops in 7:47   ran 6:31 · about 0.97 compute units
+  ● GPU running   idle 0:12 · stops in 9:48   160.4 tok/s · hit 96% · pcie 0.8% · ran 3:11 · about 0.47 compute units
 ```
 
-The last line stays live: GPU on or off, the countdown to the automatic stop, the cost so far. Paste the base URL and key into any OpenAI-compatible app: Open WebUI, the OpenAI SDKs, curl. `python3 llm.py opencode` starts opencode already connected, in any shell. After 10 minutes without requests the GPU stops by itself, and the next request starts it again. `python3 llm.py down` stops everything right away.
+## Measured Performance (Colab G4 — RTX PRO 6000 Blackwell 96 GB)
 
-## What you get
+| Metric | Measured (Basalt v0.5.7 + `UD-IQ1_M`) |
+| --- | --- |
+| End-to-end cold start | **2:59** (`143s` VM boot; optional `BASALT_PREBUILT_URL` skips ~80s build) |
+| Solo decode (`/v1/chat/completions`) | **151–160+ tok/s** (96.5% VRAM expert hit rate, <1% PCIe) |
+| OpenAI Responses (`/v1/responses`) | **193.8 tok/s** (speculative DSpark draft + 32 draft experts) |
+| Anthropic Messages (`/v1/messages`) | **152.5 tok/s** (native Claude Code compatible) |
+| 2-stream concurrent decode | **159.0 tok/s aggregate** (`78.7 + 80.3 tok/s`, 94.1% hit, 0.8% PCIe) |
+| Context & KV cache | **262,144 tokens/slot × 2 slots** (524K total, elastic FP8 KV = 0.24 GiB idle) |
+| Disk Conversation Cache | **32 GiB** `/content/conv_cache` (99.8% KV restored in **0.5 ms** across rotated sessions) |
+| Vision (`dynamic` mode) | **0 MiB idle VRAM**, ~1.0s on-demand image encode |
+| Steady-state host RAM free | **~10 GiB available** after loading 110.6 GB Engram table |
+| Cost | **~8.9 CU/hr** while GPU runs · **0 CU** when stopped |
 
-| | Images on (default) | Text only, up to 131K (`--fast`) |
+## Clients & CLI Commands
+
+| Command | Description |
+| --- | --- |
+| `python3 llm.py up [--wait-gpu]` | Start the local proxy & G4 GPU (`--wait-gpu` retries with exponential backoff up to 30 min if Colab is busy) |
+| `python3 llm.py down` | Stop the GPU, wipe VM secrets, log CU cost, and stop detached proxy |
+| `python3 llm.py watch` | Live terminal status bar with Basalt `tok/s`, VRAM hit rate, PCIe %, idle countdown, and CU cost |
+| `python3 llm.py status` | Snapshot of Web UI URL, endpoint, live Basalt telemetry, and Colab CU balance |
+| `python3 llm.py settings` | Edit defaults interactively — `effort`, `idle_min`, and `max_hours` **hot-reload live** without restarting G4 |
+| `python3 llm.py ask [opts] TEXT` | Stream an answer with `--max`, `--effort VAL`, `--image PATH` (repeatable), or piped `stdin` |
+| `python3 llm.py claude [...]` | Launch **Claude Code** pointed at `/v1/messages` (`ANTHROPIC_*` env pre-wired) |
+| `python3 llm.py codex [...]` | Launch **Codex CLI** pointed at `/v1/responses` (`OPENAI_*` env pre-wired) |
+| `python3 llm.py opencode [...]` | Launch **opencode** with auto-generated `state/opencode.json` |
+| `python3 llm.py env [--powershell]` | Emit `export` (or PowerShell `$env:`) lines for any OpenAI / Anthropic tool |
+| `python3 llm.py logs` | Show local proxy log + VM boot timeline + Basalt server & engine logs |
+
+### Built-in Web UI & Multi-Protocol Proxy
+
+- **Basalt Web UI**: Open `http://127.0.0.1:18080/` in your browser once the GPU is ready for interactive chat, live slot telemetry, and metrics.
+- **Single-model fallback**: By default, requests carrying other model names (such as Claude Code's `claude-haiku-*` / `claude-sonnet-*` background subagent calls) automatically route to `DeepSeek-V4.1-Flash-1017-UD-IQ1_M` instead of returning 404. Set `LLM_STRICT_MODEL=1` to disable.
+- **CORS preflight**: `OPTIONS` preflight (`204`) and `Access-Control-Allow-Origin: *` are handled natively for browser frontends (Open WebUI, LobeChat, etc.) while loopback `Host` header validation continues to block DNS rebinding.
+- **Multi-protocol SSE errors**: Cold-start heartbeats report live boot stages (`: starting gpu vm (5 s) - building Basalt`), and mid-stream errors format natively for OpenAI Chat (`data: {"error":...}` + `[DONE]`), OpenAI Responses (`event: error`), and Anthropic Messages (`event: error`).
+
+## Architecture & Safety
+
+1. **Monolithic Basalt pack + Punch-on-Read**: Unsloth's 249.6 GiB `DeepSeek-V4.1-Flash-1017-UD-IQ1_M.basalt` bundles weights, DSpark draft, vision encoder, and 110.6 GiB Engram table in one `BASALTMF v2` file. [`vm/basalt_jobs.py`](vm/basalt_jobs.py) splits it into backbone (139.1 GiB) + Engram (110.6 GiB). While Basalt loads experts onto GPU VRAM + resident RAM, [`vm/patch_basalt.py`](vm/patch_basalt.py) injects `fallocate(FALLOC_FL_PUNCH_HOLE)` on read and punches `dspark/gguf` + `dense`, shrinking `/mnt/ram/model.basalt` from 139.1 GiB down to **1.6 GiB** before streaming the 110.6 GiB Engram table into `/mnt/ram/engram.bin`.
+2. **43 KB In-Place Stochastic-Rounding Abliteration**: Instead of downloading gigabytes of patched tensors, [`vm/abliterate_basalt.py`](vm/abliterate_basalt.py) + [`vm/abliterate.c`](vm/abliterate.c) applies mrfakename's 43 KB rank-2 `abliteration-edit.npz` directly to all 62/62 target tensors (`Q8_0`/`Q5_K`/`Q6_K`) inside the `.basalt` pack in **1.5 seconds**.
+3. **6-Layer Cost & Reliability Protection**:
+   - **Client-disconnect GPU cancel**: `MSG_PEEK` socket watcher aborts the upstream connection within **0.5s** when a client disconnects or hits Ctrl+C/Esc, cancelling in-flight Prefill/Decode immediately.
+   - **Orphan cold-start cancel**: If a request-triggered boot loses all waiting clients for >30s, the boot cancels automatically.
+   - **Idle auto-stop**: Stops the VM after `idle_min` (default 10 min) with zero active requests; the next request wakes it seamlessly.
+   - **Hard cap**: Stops the VM at `max_hours` (default 6 h).
+   - **Detached local watchdog**: Survives proxy crashes/SIGKILL and stops the VM on idle or hard cap.
+   - **VM-side hard-cap backstop**: Independent timer inside `vm/boot.sh` terminates Basalt and wipes `/content/secrets` if your local machine sleeps or loses power.
+
+## Environment Variables
+
+| Variable | Default | Purpose |
 | --- | --- | --- |
-| Decode speed | 105.6 tok/s | 118.7 tok/s |
-| Context per request | 262,144 tokens | 131,072 tokens |
-| Image input | yes | no |
-| First token, 8K / 32K prompt | 9.9 / 27.8 s | 8.8 / 23.4 s |
-| Follow-up turns (prompt cache) | about 1 s | about 1 s |
-
-Image input and context size are separate settings. Text only up to 131K gets the faster memory layout; everything else runs at the left column's speed. Both serve two requests at a time, with tool calling and separate reasoning output. Speeds are the average of six fixed answers at reasoning effort max.
-
-## What it costs
-
-This project costs about **9 Colab compute units per hour** (8.9 measured) while the GPU runs.
-
-| Plan | Compute units every month | GPU hours |
-| --- | --- | --- |
-| Google AI Pro | 200 | about 22 |
-| Colab Pro | 100 | about 11 |
-
-Each start spends about 4 minutes (about 0.6 units) on downloading and loading. When you're not using it, nothing runs and nothing is billed.
-
-## How it works
-
-<img src="docs/assets/architecture.svg" width="820" alt="Your computer runs llm.py, a local OpenAI endpoint, connected through an SSH tunnel to a Google Colab G4 VM. The GPU (96 GB) holds attention, dense layers, about 7,800 hot experts, the draft model, the KV cache and the image encoder. RAM (190 GB) holds the 110.6 GB Engram table and all other experts, which are copied to the GPU on a miss. Hugging Face supplies about 260 GB per start.">
-
-- **The model.** ISTA-DASLab's 2-bit GSQ-RCO quantization of DeepSeek V4.1 Flash, which matched the original on their AIME, GPQA and LiveCodeBench runs. At every start, AtomicChat's 82 uncensored tensors are spliced in.
-- **The memory trick.** Each token uses 6 of the 384 experts in a layer, and some experts are used far more than others. The hottest 7,800 live on the GPU. The rest wait in RAM and cross PCIe only on a miss.
-- **The speed.** A small draft model guesses two tokens ahead and the big model checks both in one pass. On top of that, llama.cpp gets 22 patches: fused kernels, an expert cache that runs on the GPU, copies aligned to whole memory lines. Every one was checked to produce the same tokens as the build before it, within floating-point noise.
-
-<img src="docs/assets/speed.svg" width="820" alt="Decode speed by milestone: first run on IQ2_XS 43.5 tokens per second, GPU expert cache 70, draft model 87, fused kernels 100, device cache lookup 110, aligned copies 118.7. With images and 262K context it runs at 105.6.">
-
-## Read next
-
-- [SETUP.md](SETUP.md): every platform, settings, connecting apps, troubleshooting.
-- [AGENT_START_HERE.md](AGENT_START_HERE.md): point your AI coding agent here and it can set things up and help you.
-- [docs/how-it-works.md](docs/how-it-works.md): the memory layout, the boot sequence and every patch.
+| `LLM_PORT` | `18080` | Local proxy port |
+| `LLM_BIND` | `127.0.0.1` | Bind interface |
+| `LLM_MODEL_ALIAS` | `DeepSeek-V4.1-Flash-1017-UD-IQ1_M` | Served model ID |
+| `LLM_STRICT_MODEL` | `0` | Set `1` to disable automatic routing of unknown model names |
+| `LLM_IDLE_MIN` | `10` | Idle auto-stop timeout (minutes) |
+| `LLM_MAX_HOURS` | `6` | Hard-stop cap (hours) |
+| `LLM_IMAGES` / `LLM_CONTEXT` | `1` / `262144` | Override dynamic vision / context per slot |
+| `LLM_WAIT_GPU` | `0` | Set `1` (or pass `--wait-gpu`) for 30-min exponential backoff allocation |
+| `HF_TOKEN` | — | Optional Hugging Face token (sent to VM only, redacted from logs) |
+| `BASALT_PREBUILT_URL` | — | Optional URL to a prebuilt `basalt` sm_120 binary (skips ~80s compile) |
+| `BASALT_PREBUILT_SHA256` | — | Optional SHA-256 verification for `BASALT_PREBUILT_URL` |
 
 ## Credits
 
-Built on DeepSeek V4.1 Flash by DeepSeek, the GSQ-RCO GGUF by ISTA-DASLab, uncensored tensors by AtomicChat, the DSpark draft GGUF by unsloth, llama.cpp by ggml-org and Google's Colab CLI. The model files come straight from their Hugging Face pages, under their licenses.
-
-Uncensored means the model refuses less often. What you do with it is up to you.
-
-## What's next
-
-DeepSeek V4.1 Flash is the first model. More models are planned, each tuned for Colab the same way, so that this repo becomes a hub: pick a model at the start, run `up`, and get fast inference from the same optimized kernels and memory layout.
+Built on [Basalt](https://github.com/jesdga95/basalt) by jesdga95, DeepSeek-V4.1-Flash by DeepSeek, the `UD-IQ1_M.basalt` pack by Unsloth, rank-2 `abliteration-edit.npz` by mrfakename, Google's Colab CLI, and originally forked from [leonxger/deepseek-colab](https://github.com/leonxger/deepseek-colab).

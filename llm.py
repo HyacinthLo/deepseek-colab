@@ -1,30 +1,32 @@
 #!/usr/bin/env python3
-"""Runs uncensored DeepSeek-V4.1-Flash on a Google Colab G4 behind a local OpenAI-compatible endpoint; see README.md."""
+"""Runs uncensored DeepSeek-V4.1-Flash (UD-IQ1_M) on Google Colab G4 via Basalt v0.5.7 behind a local OpenAI/Anthropic endpoint."""
 import sys
 
 if sys.version_info < (3, 9):
     sys.exit('llm.py needs Python 3.9 or newer (this is %d.%d)' % sys.version_info[:2])
-import hmac, http.client, io, json, os, re, secrets, shlex, shutil, signal, socket, socketserver, subprocess, tarfile
+import base64, hmac, http.client, io, json, mimetypes, os, re, secrets, select, shlex, shutil, signal, socket, socketserver, subprocess, tarfile
 import threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-USAGE = '''usage: python3 llm.py COMMAND [--fast] [--basalt|--llama]
-  up            set up on first use, start the GPU and print the endpoint (base URL, API key, models)
+USAGE = '''usage: python3 llm.py COMMAND [--wait-gpu]
+  up            set up on first use, start the GPU and print the endpoint (Web UI, Base URL, API key, model)
   down          stop the GPU and the local endpoint
-  status        endpoint state, Colab balance and session
-  watch         live view: GPU on or off, idle countdown to the auto-stop, cost so far (up shows it too)
-  settings      change the saved defaults: engine, image input, context, reasoning effort, idle stop, hard stop, uncensored
-  ask TEXT      send one question and stream the answer (--max for reasoning effort max)
-  opencode ...  start opencode with this endpoint configured, in any shell; arguments go to opencode
-  logs          local log plus the GPU's boot timeline and server log
+  status        endpoint state, live Basalt telemetry, Colab balance and session
+  watch         live view: GPU state, tok/s, VRAM hit rate, idle countdown, cost so far (up shows it too)
+  settings      change defaults: image input, context, reasoning effort, idle stop, hard stop, uncensored (hot-reloads live!)
+  ask TEXT      send one question and stream the answer (--max, --effort VAL, --image PATH, or piped stdin)
+  claude ...    start Claude Code pointed at this endpoint (Anthropic /v1/messages)
+  codex ...     start Codex CLI pointed at this endpoint (OpenAI /v1/responses)
+  opencode ...  start opencode with this endpoint configured; arguments go to opencode
+  env           print shell export commands for OpenAI & Anthropic clients (--powershell for PowerShell)
+  logs          local log plus the GPU's boot timeline, server log and engine log
   setup         install and log in only, start nothing
   serve         run the endpoint in the foreground (Ctrl+C stops the GPU too)
-  --fast        this run only: text only, 131K context, the faster layout
-  --basalt      this run only: Basalt v0.5.7 + UD-IQ1_M.basalt with abliteration (default, ~160 tok/s)
-  --llama       this run only: legacy llama.cpp + ISTA IQ2_XXS GGUF (105.6 / 118.7 tok/s)
+  --wait-gpu    keep retrying G4 allocation with exponential backoff (up to 30 min) if Colab is busy
 env: LLM_PORT (18080) LLM_IDLE_MIN (10) LLM_MAX_HOURS (6) LLM_MIN_BALANCE (5) LLM_IMAGES (0|1) LLM_CONTEXT (4096-262144)
-     LLM_PROFILE (default|fast presets) LLM_ENGINE (basalt|llama) LLM_BIND (127.0.0.1)
-     HF_TOKEN (optional Hugging Face token for the downloads) LLM_YES=1 (answer yes to install prompts) LLM_BOOT_ENV ("K=V ...")
+     LLM_MODEL_ALIAS (DeepSeek-V4.1-Flash-1017-UD-IQ1_M) LLM_STRICT_MODEL (0|1) LLM_WAIT_GPU (0|1) LLM_BIND (127.0.0.1)
+     HF_TOKEN (optional Hugging Face token) LLM_YES=1 (skip install prompts) LLM_BOOT_ENV ("K=V ...")
+     BASALT_PREBUILT_URL / BASALT_PREBUILT_SHA256 (optional prebuilt basalt binary cache)
      LLM_SESSION LLM_COLAB LLM_STATE LLM_VM_DIR; tests: LLM_SSH_CMD LLM_TUNNEL_PORT LLM_POLL_S'''
 
 IS_WIN = os.name == 'nt'
@@ -34,7 +36,8 @@ KEY_FILE, SSH_KEY = os.path.join(STATE, 'api_key'), os.path.join(STATE, 'id_ed25
 SESSION, LOCK, LOG = (os.path.join(STATE, f) for f in ('session.json', 'serve.lock', 'llm.log'))
 SETTINGS_FILE = os.path.join(STATE, 'settings.json')
 VM_DIR = os.path.abspath(os.environ.get('LLM_VM_DIR') or os.path.join(ROOT, 'vm'))
-DEFAULTS = {'engine': 'basalt', 'images': True, 'context': 262144, 'effort': '50', 'idle_min': 10, 'max_hours': 6, 'uncensor': True}
+MODEL_ID = os.environ.get('LLM_MODEL_ALIAS') or 'DeepSeek-V4.1-Flash-1017-UD-IQ1_M'
+DEFAULTS = {'images': True, 'context': 262144, 'effort': '50', 'idle_min': 10, 'max_hours': 6, 'uncensor': True}
 
 
 def load_settings():
@@ -58,48 +61,30 @@ MIN_BALANCE = float(os.environ.get('LLM_MIN_BALANCE', '5'))
 TUNNEL_PORT = int(os.environ.get('LLM_TUNNEL_PORT', '0'))
 POLL_S = float(os.environ.get('LLM_POLL_S', '15'))
 HEALTH_S = min(1.0, POLL_S)
+ORPHAN_BOOT_S = float(os.environ.get('LLM_ORPHAN_BOOT_S', '30'))
 BOOT_TIMEOUT, FAIL_COOLDOWN, KEEPALIVE_S, MAX_BODY, UPSTREAM_TIMEOUT = 1500, 60, 5, 64 << 20, 3600
 COLAB_CLI = 'google-colab-cli==0.7.5'
 G4_CU_PER_HOUR = 8.9
-# Legacy llama.cpp GPU memory layouts on G4 (kept intact for --llama fallback)
-LAYOUTS = {'default': {'ENGINE': 'llama', 'UBATCH': '2048', 'MOE_CACHE_MIB': '70430', 'DYN': '110', 'DMA': '0', 'SPEED': '105.6'},
-           'fast': {'ENGINE': 'llama', 'UBATCH': '3072', 'MOE_CACHE_MIB': '74231', 'DYN': '166', 'DMA': '1', 'SPEED': '118.7'}}
-# Default backend: Basalt v0.5.7 (160.4 tok/s solo, 95-98.7% VRAM expert hit rate, dynamic 0-idle-VRAM vision, elastic FP8 KV)
-_BASALT_DEFAULT = {'ENGINE': 'basalt', 'QUANT': 'iq1_m', 'UBATCH': '2048', 'MOE_CACHE_MIB': '77700', 'DYN': '0', 'DMA': '1',
-                   'VRAM_RESERVE': '700', 'RAM_BUDGET': '55', 'SPEED': '160.4'}
-ENGINE_LAYOUTS = {
-    'basalt': {'default': _BASALT_DEFAULT, 'fast': _BASALT_DEFAULT},
-    'llama': LAYOUTS,
-}
-ENGINE_NAMES = {
-    'basalt': 'Basalt v0.5.7 (UD-IQ1_M)',
-    'llama': 'llama.cpp (ISTA IQ2_XXS)',
-}
+ESTIMATED_SPEED = '160.4'
 CONTEXTS = {'32k': 32768, '64k': 65536, '128k': 131072, '131k': 131072, '256k': 262144, '262k': 262144}
-BOOT_KEYS = ('ENGINE', 'QUANT', 'CTX', 'UBATCH', 'MMPROJ', 'MOE_CACHE_MIB', 'DYN', 'DMA', 'VRAM_RESERVE', 'RAM_BUDGET',
-             'DRAFT', 'UNCENSOR', 'WORKERS')
+BOOT_KEYS = ('MODEL_ALIAS', 'CTX', 'MMPROJ', 'VRAM_RESERVE', 'RAM_BUDGET', 'DRAFT', 'UNCENSOR', 'WORKERS',
+             'MAX_HOURS', 'CONV_CACHE_MIB', 'BASALT_PREBUILT_URL', 'BASALT_PREBUILT_SHA256')
 VM_PORT = 18080
 NO_WINDOW, DETACHED, NEW_GROUP, BREAKAWAY = 0x08000000, 0x00000008, 0x00000200, 0x01000000
 CHILD_FLAGS = NO_WINDOW if IS_WIN else 0
 CHILD_ENV = dict(os.environ, PYTHONUTF8='1', PYTHONIOENCODING='utf-8')
 HOP = {'connection', 'keep-alive', 'proxy-connection', 'proxy-authorization', 'te', 'trailer', 'transfer-encoding', 'upgrade',
        'content-length', 'host', 'accept-encoding', 'expect', 'server', 'date'}
-STEPS = (('encoder', r'image encoder fetched', 'image encoder downloaded (1 GB)'),
-         ('patch', r'uncensor patch fetched', 'uncensored tensors downloaded (1.7 GB)'),
-         ('patch', r'abliteration edit fetched', 'abliteration edit downloaded (43 KB)'),
-         ('draft', r'draft fetched', 'draft model downloaded (8 GB)'),
-         ('model', r'backbone fetched \(basalt [^)]+\)', 'model downloaded (Basalt pack)'),
-         ('model', r'backbone fetched$', 'model downloaded (138 GB)'),
+STEPS = (('patch', r'abliteration edit fetched', 'abliteration edit downloaded (43 KB)'),
+         ('model', r'backbone fetched \(basalt [^)]+\)', 'model downloaded (Basalt UD-IQ1_M)'),
          ('build', r'basalt built', 'Basalt v0.5.7 built'),
-         ('build', r'llama\.cpp built', 'llama.cpp built'),
-         ('abliterate', r'abliteration applied', 'abliteration baked into weights'),
-         ('loaded', r'weights loaded', 'model loaded onto the GPU + RAM'),
-         ('loaded', r'healthy', 'model loaded onto the GPU'),
-         ('pinned', r'pin: ', 'RAM freed, cold experts pinned'),
-         ('engram', r'engram done', 'Engram table loaded (110 GB)'),
+         ('abliterate', r'abliteration applied', 'abliteration baked into weights (62/62)'),
+         ('loaded', r'weights loaded', 'model loaded onto GPU + RAM'),
+         ('pinned', r'pin: ', 'tmpfs RAM punched & reclaimed'),
+         ('engram', r'engram done', 'Engram table loaded (110.6 GB)'),
          ('warm', r'first token', 'warmup answer done'))
-LATER = (('loaded', 'loading the model onto the GPU'), ('pinned', 'freeing RAM and pinning experts'),
-         ('engram', 'loading the Engram table (110 GB)'), ('warm', 'warming up'))
+LATER = (('loaded', 'loading the model onto GPU + RAM'), ('pinned', 'reclaiming tmpfs RAM'),
+         ('engram', 'loading the Engram table (110.6 GB)'), ('warm', 'warming up'))
 ECHO, TTY, COLOR = [True], [False], [False]
 _log_lock = threading.Lock()
 _cache = {}
@@ -232,13 +217,8 @@ def short_context(n):
 
 
 def choice():
-    """Image input and context per request in effect: LLM_PROFILE or --fast presets, then LLM_IMAGES and LLM_CONTEXT, then the settings."""
+    """Image input and context per slot in effect: LLM_IMAGES and LLM_CONTEXT override saved settings."""
     images, context = bool(SETTINGS['images']), context_value(SETTINGS['context']) or 262144
-    preset = os.environ.get('LLM_PROFILE')
-    if preset:
-        if preset not in LAYOUTS:
-            sys.exit('unknown LLM_PROFILE %r (use default or fast)' % preset)
-        images, context = (True, 262144) if preset == 'default' else (False, 131072)
     if os.environ.get('LLM_IMAGES'):
         images = os.environ['LLM_IMAGES'] == '1'
     if os.environ.get('LLM_CONTEXT'):
@@ -246,42 +226,21 @@ def choice():
     return images, context
 
 
-def layout(images, context):
-    return 'fast' if not images and context <= 131072 else 'default'
-
-
 def describe(images, context):
-    return '%s context · image input %s' % (short_context(context), 'on' if images else 'off')
-
-
-def model_efforts():
-    return (('ds41', str(SETTINGS['effort'])), ('ds41-max', 'max'))
-
-
-def engine_value(text):
-    t = (text or '').strip().lower()
-    return t if t in ENGINE_LAYOUTS else None
-
-
-def engine_choice():
-    raw = os.environ.get('LLM_ENGINE') or SETTINGS.get('engine') or 'basalt'
-    e = engine_value(raw)
-    if not e:
-        sys.exit('unknown LLM_ENGINE %r (use basalt or llama)' % raw)
-    return e
+    return '%s context · dynamic vision %s' % (short_context(context), 'on' if images else 'off')
 
 
 def profile():
-    """Boot values for the chosen engine, images and context; CTX is the total of the 2 request slots."""
+    """Boot values for Basalt v0.5.7 on Colab G4; CTX is the total across 2 parallel slots."""
     images, context = choice()
-    eng = engine_choice()
-    lay = ENGINE_LAYOUTS[eng][layout(images, context)]
-    out = {'ENGINE': lay['ENGINE'], 'CTX': str(2 * context), 'UBATCH': lay['UBATCH'], 'MMPROJ': '1' if images else '0',
-           'MOE_CACHE_MIB': lay['MOE_CACHE_MIB'], 'DYN': lay['DYN'], 'DMA': lay['DMA']}
-    for k in ('QUANT', 'VRAM_RESERVE', 'RAM_BUDGET'):
-        if k in lay:
-            out[k] = lay[k]
-    return out
+    return {
+        'MODEL_ALIAS': MODEL_ID,
+        'CTX': str(2 * context),
+        'MMPROJ': '1' if images else '0',
+        'VRAM_RESERVE': '700',
+        'RAM_BUDGET': '55',
+        'MAX_HOURS': str(MAX_HOURS),
+    }
 
 
 COLAB = colab_cmd()
@@ -584,19 +543,16 @@ def vm_files():
 
 
 def missing_vm_files():
-    """Files that boot/serve/build scripts or patches/series name but vm/ lacks; a start is refused before allocation."""
+    """Files that boot/serve/build scripts name but vm/ lacks; a start is refused before allocation."""
     have, refs = set(vm_files()), set()
-    scripts = ('boot.sh', 'serve.sh', 'build.sh', 'boot_basalt.sh', 'serve_basalt.sh', 'build_basalt.sh')
+    scripts = ('boot.sh', 'serve.sh', 'build.sh')
     for f in scripts:
         try:
             with open(os.path.join(VM_DIR, f), encoding='utf-8', errors='replace') as fh:
                 refs |= set(re.findall(r'(?:\$V|/content/vm)/([\w.-]+\.(?:py|sh|txt|c))\b', fh.read()))
         except OSError:
             refs.add(f)
-    refs |= set(scripts) | {'patches/series'}
-    if 'patches/series' in have:
-        with open(os.path.join(VM_DIR, 'patches', 'series'), encoding='utf-8') as fh:
-            refs |= {'patches/' + l.strip() for l in fh if l.strip() and not l.startswith('#')}
+    refs |= set(scripts)
     return sorted(r for r in refs if r not in have and '$' not in r)
 
 
@@ -636,7 +592,6 @@ def boot_env():
 
 def boot_cmd(envs):
     return ('cd /content && umask 077 && tar xzf bundle.tgz && rm -f bundle.tgz && chmod 700 secrets && chmod 600 secrets/* && '
-            'gcc -shared -fPIC -O2 -o vm/libpin.so vm/pin.c -ldl -lpthread && '
             'mkdir -p res && (%s setsid nohup bash vm/boot.sh > res/boot.out 2>&1 < /dev/null &) && echo BOOT_STARTED' % envs)
 
 
@@ -745,9 +700,11 @@ class Manager:
         self.state, self.steps, self.attempt, self.errors, self.begun = 'off', [], 0, {}, 0.0
         self.fail_until, self.fail_msg, self.stop_reason = 0.0, '', None
         self.active, self.last_activity, self.served = 0, time.time(), 0
+        self.waiters, self.waiter_lost_at, self.explicit_up, self.alloc_note = 0, None, False, ''
         self.tunnel, self.port, self.tunnel_ok, self.repairing = None, None, False, False
         self.sess, self.closing, self.last_retry = None, False, 0.0
         self.tlock, self.no_tunnel, self.last_stop = threading.Lock(), False, None
+        self._stats_lock, self._stats_at, self._stats_cache = threading.Lock(), 0.0, None
 
     def ready(self):
         return self.state == 'ready' and self.tunnel_ok
@@ -765,30 +722,46 @@ class Manager:
             self.served += served
             self.last_activity = time.time()
 
-    def acquire(self, on_tick=None, every=KEEPALIVE_S):
+    def acquire(self, on_tick=None, every=KEEPALIVE_S, explicit=False, is_gone=None):
         """Waits until the VM serves requests and counts the caller as active; returns None or an error message."""
         t0 = time.time()
         tick, mine = t0 + every, None
-        while True:
+        with self.cond:
+            self.waiters += 1
+            self.waiter_lost_at = None
+            if explicit:
+                self.explicit_up = True
+        try:
+            while True:
+                if is_gone and is_gone():
+                    return 'client disconnected'
+                with self.cond:
+                    if self.ready():
+                        self.active += 1
+                        return None
+                    if mine is not None and mine in self.errors:
+                        return self.errors[mine]
+                    if mine is None and self.state in ('off', 'stopping') and time.time() < self.fail_until:
+                        return self.fail_msg
+                    if self.state == 'off':
+                        if self.closing:
+                            return 'proxy is shutting down'
+                        self._begin(True, explicit=explicit)
+                    if self.state == 'starting':
+                        mine = self.attempt
+                        if explicit:
+                            self.explicit_up = True
+                    wait_s = max(0.05, tick - time.time())
+                    self.cond.wait(min(0.5, wait_s) if is_gone else wait_s)
+                if time.time() >= tick:
+                    tick += every
+                    if on_tick:
+                        on_tick(int(time.time() - t0))
+        finally:
             with self.cond:
-                if self.ready():
-                    self.active += 1
-                    return None
-                if mine is not None and mine in self.errors:
-                    return self.errors[mine]
-                if mine is None and self.state in ('off', 'stopping') and time.time() < self.fail_until:
-                    return self.fail_msg
-                if self.state == 'off':
-                    if self.closing:
-                        return 'proxy is shutting down'
-                    self._begin(True)
-                if self.state == 'starting':
-                    mine = self.attempt
-                self.cond.wait(max(0.05, tick - time.time()))
-            if time.time() >= tick:
-                tick += every
-                if on_tick:
-                    on_tick(int(time.time() - t0))
+                self.waiters = max(0, self.waiters - 1)
+                if self.waiters == 0 and self.state == 'starting' and not self.explicit_up:
+                    self.waiter_lost_at = time.time()
 
     def wait_off(self, on_tick=None, limit=900, every=KEEPALIVE_S):
         t0 = time.time()
@@ -807,11 +780,12 @@ class Manager:
     def adopt(self):
         with self.cond:
             if self.state == 'off':
-                self._begin(False)
+                self._begin(False, explicit=True)
 
-    def _begin(self, new):
+    def _begin(self, new, explicit=False):
         self.attempt += 1
         self.state, self.steps, self.stop_reason, self.no_tunnel, self.begun = 'starting', [], None, False, time.time()
+        self.explicit_up, self.waiter_lost_at, self.alloc_note = explicit, None, ''
         threading.Thread(target=self._run_start, args=(self.attempt, new), daemon=True).start()
 
     def _check_stop(self):
@@ -826,6 +800,7 @@ class Manager:
         except Exception as e:
             ok, err = False, 'internal error: %r' % e
         with self.cond:
+            self.alloc_note = ''
             if ok and not self.stop_reason:
                 self.state, self.tunnel_ok, self.last_activity = 'ready', True, time.time()
                 self.cond.notify_all()
@@ -868,7 +843,8 @@ class Manager:
         except Exception as e:
             log('stop failed: %r' % e)
         with self.cond:
-            self.state, self.tunnel_ok, self.sess = 'off', False, None
+            self.state, self.tunnel_ok, self.sess, self.alloc_note = 'off', False, None, ''
+            self._stats_cache = None
             self.cond.notify_all()
 
     def _stage(self, s, key, t0):
@@ -879,11 +855,10 @@ class Manager:
         """What the start is doing now, derived from the steps done so far."""
         done = {key for key, at, label in self.steps}
         if 'allocated' not in done:
-            return 'allocating a G4 GPU'
+            return self.alloc_note or 'allocating a G4 GPU'
         if 'uploaded' not in done:
             return 'uploading the boot files'
-        build_label = 'building Basalt' if profile().get('ENGINE') == 'basalt' else 'building llama.cpp'
-        todo = [w for k, w in (('model', 'downloading the model'), ('build', build_label)) if k not in done]
+        todo = [w for k, w in (('model', 'downloading the model'), ('build', 'building Basalt')) if k not in done]
         rest = [w for k, w in LATER if k not in done]
         todo = [] if len(rest) < len(LATER) else todo
         return ' and '.join(todo) if todo else rest[0] if rest else 'opening the endpoint'
@@ -913,6 +888,12 @@ class Manager:
             self._await_ready(s, adopted=False)
         return True
 
+    def _sleep_cancelable(self, seconds):
+        end = time.time() + seconds
+        while time.time() < end:
+            self._check_stop()
+            time.sleep(min(0.5, max(0.05, end - time.time())))
+
     def _launch(self):
         envs = boot_env()
         try:
@@ -937,15 +918,25 @@ class Manager:
         s['watchdog'] = spawn_watchdog(t0)
         save_session(s)
         self.sess = s
-        log('up: %s, balance %.2f CU, hard stop after %.1f h, idle stop after %.1f min' % (describe(*choice()), bal, MAX_HOURS, IDLE_MIN))
-        for attempt in range(2):
+        log('up: %s (%s), balance %.2f CU, hard stop after %.1f h, idle stop after %.1f min'
+            % (MODEL_ID, describe(*choice()), bal, MAX_HOURS, IDLE_MIN))
+        wait_gpu = os.environ.get('LLM_WAIT_GPU') == '1'
+        deadline = time.time() + (1800 if wait_gpu else 300)
+        max_attempts = 40 if wait_gpu else 3
+        delay_scale = min(1.0, POLL_S / 15.0)
+        out = ''
+        for attempt in range(max_attempts):
             rc, out = colab(['new', '-s', NAME, '--gpu', 'G4'], 300)
             if rc == 0 and 'READY' in out:
+                self.alloc_note = ''
                 break
             log('allocation attempt %d failed: %s' % (attempt + 1, out.strip()[-300:]))
             self._check_stop()
-        else:
-            raise StartError('no G4 GPU from Colab (none free, or the plan has no compute units for it): ' + out.strip()[-200:])
+            if attempt + 1 >= max_attempts or time.time() >= deadline:
+                raise StartError('no G4 GPU from Colab (none free, or the plan has no compute units for it): ' + out.strip()[-200:])
+            wait_s = min(60.0, 10.0 * (2 ** min(attempt, 3))) * max(0.02, delay_scale)
+            self.alloc_note = 'waiting for G4 GPU (retry %d in %ds)' % (attempt + 2, max(1, int(wait_s)))
+            self._sleep_cancelable(wait_s)
         self._stage(s, 'allocated', t0)
         log('G4 allocated after %.0f s' % s['stages']['allocated'])
         self.steps.append(('allocated', time.time(), 'G4 GPU allocated'))
@@ -966,8 +957,7 @@ class Manager:
             raise StartError('boot start failed: ' + out.strip()[-300:])
         self._stage(s, 'boot_started', t0)
         self.steps.append(('uploaded', time.time(), None))
-        eta = '2-3 minutes' if profile().get('ENGINE') == 'basalt' else '4 minutes'
-        log('boot started on the GPU VM after %.0f s; ready in about %s' % (s['stages']['boot_started'], eta))
+        log('boot started on the GPU VM after %.0f s; ready in about 2-3 minutes' % s['stages']['boot_started'])
         return s
 
     def _await_ready(self, s, adopted):
@@ -1113,8 +1103,12 @@ class Manager:
             now = time.time()
             with self.cond:
                 st, s, p = self.state, self.sess, self.tunnel
+                orphan_boot = (st == 'starting' and not self.explicit_up and self.waiters == 0 and
+                               self.waiter_lost_at is not None and now - self.waiter_lost_at > ORPHAN_BOOT_S)
             if st in ('starting', 'ready') and s and now > s.get('t0', now) + MAX_HOURS * 3600:
                 self.request_stop('hard stop after %.2f h' % MAX_HOURS)
+            elif orphan_boot:
+                self.request_stop('all waiting clients disconnected')
             elif st == 'ready':
                 self.request_stop('idle %.1f min' % IDLE_MIN, only_idle=True)
                 if p is not None and p.poll() is not None:
@@ -1132,19 +1126,63 @@ class Manager:
             self.request_stop('proxy exit')
             self.wait_off()
 
+    def basalt_stats(self):
+        """Cached live snapshot from Basalt /status and /metrics (never blocks inference lock)."""
+        if not self.ready() or not self.port:
+            return None
+        with self._stats_lock:
+            now = time.time()
+            if self._stats_cache is not None and now - self._stats_at < 0.8:
+                return self._stats_cache
+            port = self.port
+            hdrs = {'Authorization': 'Bearer ' + api_key()}
+            out = {}
+            for ep in ('/status', '/metrics'):
+                try:
+                    conn, r = http_call(port, 'GET', ep, headers=hdrs, timeout=1.2)
+                    raw = r.read() if r.status == 200 else b''
+                    conn.close()
+                    if raw:
+                        data = json.loads(raw)
+                        if ep == '/status' and isinstance(data, dict):
+                            out['busy'] = bool(data.get('busy'))
+                            if data.get('tokens_per_s') is not None:
+                                out['live_tok_s'] = data['tokens_per_s']
+                            elif data.get('tokens_per_s_mean') is not None:
+                                out['live_tok_s'] = data['tokens_per_s_mean']
+                        elif ep == '/metrics' and isinstance(data, dict):
+                            live = data.get('live') or {}
+                            if live.get('queued') is not None:
+                                out['queued'] = live['queued']
+                            reqs = data.get('requests') or []
+                            last = next((x for x in reqs if isinstance(x, dict) and x.get('decode_tok_s') is not None), None)
+                            if last:
+                                out['last_tok_s'] = last.get('decode_tok_s')
+                                out['hit_rate'] = last.get('hit_rate')
+                                out['pcie_share'] = last.get('pcie_share')
+                                out['draft_len'] = last.get('draft_len')
+                except (OSError, ValueError, http.client.HTTPException):
+                    pass
+            self._stats_at = time.time()
+            self._stats_cache = out or None
+            return self._stats_cache
+
     def status(self):
+        basalt = self.basalt_stats()
         with self.cond:
             s = self.sess or {}
             state = 'ready (tunnel reconnecting)' if self.state == 'ready' and not self.tunnel_ok else self.state
             ran = time.time() - s['t0'] if s.get('t0') and self.state != 'off' else None
-            return {'state': state, 'stage': self.activity() if self.state == 'starting' else '', 'session': NAME, 'active': self.active,
-                    'served': self.served, 'ran': ran, 'cu': ran / 3600 * G4_CU_PER_HOUR if ran is not None else None,
-                    'last_stop': self.last_stop, 'idle_s': round(time.time() - self.last_activity), 'idle_stop_min': IDLE_MIN, 'max_hours': MAX_HOURS,
-                    'started': s.get('started'), 'stages': s.get('stages'), 'last_error': self.fail_msg or None, 'pid': os.getpid()}
+            return {'state': state, 'stage': self.activity() if self.state == 'starting' else '', 'session': NAME,
+                    'model': MODEL_ID, 'active': self.active, 'served': self.served, 'ran': ran,
+                    'cu': ran / 3600 * G4_CU_PER_HOUR if ran is not None else None, 'last_stop': self.last_stop,
+                    'idle_s': round(time.time() - self.last_activity), 'idle_stop_min': IDLE_MIN, 'max_hours': MAX_HOURS,
+                    'effort': SETTINGS['effort'], 'started': s.get('started'), 'stages': s.get('stages'),
+                    'last_error': self.fail_msg or None, 'pid': os.getpid(), 'basalt': basalt}
 
 
-def with_effort(body, path='/v1/chat/completions'):
-    """The model name ds41-max means reasoning effort max for clients that do not send reasoning_effort themselves."""
+def rewrite_request(body, path='/v1/chat/completions'):
+    """Single-model routing to MODEL_ID (unless LLM_STRICT_MODEL=1) plus saved default reasoning effort injection."""
     try:
         req = json.loads(body)
     except ValueError:
@@ -1152,9 +1190,11 @@ def with_effort(body, path='/v1/chat/completions'):
     if not isinstance(req, dict):
         return body
     changed = False
-    model = req.get('model')
-    effort = dict(model_efforts()).get(model)
-    if effort is not None and effort != '50':
+    if os.environ.get('LLM_STRICT_MODEL') != '1' and req.get('model') != MODEL_ID:
+        req['model'] = MODEL_ID
+        changed = True
+    effort = str(SETTINGS['effort'])
+    if effort != '50':
         if path == '/v1/chat/completions' and req.get('reasoning_effort') is None:
             req['reasoning_effort'] = effort
             changed = True
@@ -1166,11 +1206,38 @@ def with_effort(body, path='/v1/chat/completions'):
             elif isinstance(reasoning, dict) and reasoning.get('effort') is None:
                 req['reasoning'] = dict(reasoning, effort=effort)
                 changed = True
-    # Basalt serves a single alias ("ds41") and returns 404 for unknown model names like "ds41-max"
-    if model == 'ds41-max' and ENGINE_LAYOUTS[engine_choice()]['default']['ENGINE'] == 'basalt':
-        req['model'] = 'ds41'
-        changed = True
     return json.dumps(req).encode() if changed else body
+
+
+def apply_hot_settings(updates=None):
+    """Applies hot-reloadable settings (effort, idle_min, max_hours) live without restarting the GPU."""
+    global IDLE_MIN, MAX_HOURS
+    old_cold = (SETTINGS['images'], SETTINGS['context'], SETTINGS['uncensor'])
+    fresh = load_settings()
+    if isinstance(updates, dict):
+        for k, v in updates.items():
+            if k in DEFAULTS:
+                fresh[k] = v
+    SETTINGS.update(fresh)
+    IDLE_MIN = float(SETTINGS['idle_min'])
+    MAX_HOURS = float(SETTINGS['max_hours'])
+    restart_required = (SETTINGS['images'], SETTINGS['context'], SETTINGS['uncensor']) != old_cold
+    return {'effort': SETTINGS['effort'], 'idle_min': IDLE_MIN, 'max_hours': MAX_HOURS}, restart_required
+
+
+def abort_upstream(conn):
+    """Immediately shuts down an upstream HTTPConnection so Basalt cancels in-flight Prefill/Decode."""
+    if conn is None:
+        return
+    try:
+        if conn.sock:
+            conn.sock.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass
+    try:
+        conn.close()
+    except OSError:
+        pass
 
 
 def error_obj(code, msg, kind='unavailable_error'):
@@ -1193,10 +1260,22 @@ class Handler(BaseHTTPRequestHandler):
     def chunk(self, data):
         self.wfile.write(b'%x\r\n%s\r\n' % (len(data), data))
 
+    def send_cors(self, preflight=False):
+        if not preflight and not self.headers.get('Origin'):
+            return
+        self.send_header('Access-Control-Allow-Origin', '*')
+        if preflight:
+            self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+            asked = self.headers.get('Access-Control-Request-Headers')
+            self.send_header('Access-Control-Allow-Headers',
+                             asked or 'Authorization, Content-Type, x-api-key, anthropic-version, anthropic-beta')
+            self.send_header('Access-Control-Max-Age', '86400')
+
     def send_json(self, code, obj):
         data = json.dumps(obj).encode()
         self.send_response(code)
         self.send_header('Content-Type', 'application/json')
+        self.send_cors()
         self.send_header('Content-Length', str(len(data)))
         self.end_headers()
         self.wfile.write(data)
@@ -1205,6 +1284,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header('Content-Type', ctype)
         self.send_header('Cache-Control', 'no-cache')
+        self.send_cors()
         self.send_header('Transfer-Encoding', 'chunked')
         self.end_headers()
 
@@ -1212,8 +1292,16 @@ class Handler(BaseHTTPRequestHandler):
         obj = obj or error_obj(code, msg)
         if not sse:
             return self.send_json(code, obj)
+        path = self.path.split('?')[0]
+        err = obj.get('error') if isinstance(obj, dict) and isinstance(obj.get('error'), dict) else {'code': code, 'message': msg or str(obj), 'type': 'unavailable_error'}
+        if path == '/v1/messages':
+            payload = b'event: error\ndata: ' + json.dumps({'type': 'error', 'error': err}).encode() + b'\n\n'
+        elif path == '/v1/responses':
+            payload = b'event: error\ndata: ' + json.dumps({'type': 'error', 'code': err.get('code', code), 'message': err.get('message', msg)}).encode() + b'\n\n'
+        else:
+            payload = b'data: ' + json.dumps({'error': err}).encode() + b'\n\ndata: [DONE]\n\n'
         try:
-            self.chunk(b'data: ' + json.dumps(obj).encode() + b'\n\n')
+            self.chunk(payload)
             self.wfile.write(b'0\r\n\r\n')
         except OSError:
             pass
@@ -1254,6 +1342,14 @@ class Handler(BaseHTTPRequestHandler):
             self.fail(400, 'bad request body', obj=error_obj(400, 'bad request body', 'invalid_request_error'))
         return None
 
+    def do_OPTIONS(self):
+        if not self.host_ok():
+            return self.fail(403, 'unexpected Host header', obj=error_obj(403, 'unexpected Host header', 'permission_error'))
+        self.send_response(204)
+        self.send_cors(preflight=True)
+        self.send_header('Content-Length', '0')
+        self.end_headers()
+
     def do_GET(self):
         self.route(None)
 
@@ -1270,8 +1366,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def models(self):
         info = profile()
-        return {'object': 'list', 'data': [{'id': m, 'object': 'model', 'owned_by': 'llm.py', 'created': 0, 'reasoning_effort': e,
-                                            'context_length': int(info['CTX']) // 2, 'image_input': info['MMPROJ'] == '1'} for m, e in model_efforts()]}
+        entry = {'id': MODEL_ID, 'object': 'model', 'owned_by': 'basalt', 'created': 0,
+                 'reasoning_effort': str(SETTINGS['effort']),
+                 'context_length': int(info['CTX']) // 2, 'image_input': info['MMPROJ'] == '1'}
+        # "data" is the OpenAI list shape; "models" is what newer Codex builds decode
+        return {'object': 'list', 'data': [entry], 'models': [entry]}
 
     def route(self, body):
         mgr, path = self.server.mgr, self.path.split('?')[0]
@@ -1279,12 +1378,12 @@ class Handler(BaseHTTPRequestHandler):
             return self.fail(403, 'unexpected Host header', obj=error_obj(403, 'unexpected Host header', 'permission_error'))
         if path.startswith('/_llm/'):
             return self.control(path, body)
-        if path == '/v1/models' and body is None:
+        if path in ('/v1/models', '/models') and body is None:
             if self.authed():
                 self.send_json(200, self.models())
             return
         if body and path in ('/v1/chat/completions', '/v1/messages', '/v1/messages/count_tokens', '/v1/responses'):
-            body = with_effort(body, path)
+            body = rewrite_request(body, path)
         if body is not None and path.startswith('/v1/'):
             if self.authed():
                 t0 = time.time()
@@ -1302,6 +1401,15 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json(503, dict(error_obj(503, 'gpu vm %s' % mgr.state), status=mgr.state))
         self.fail(503, 'gpu vm %s; a POST to /v1/... starts it' % mgr.state)
 
+    def client_gone(self):
+        try:
+            readable, _, _ = select.select([self.connection], [], [], 0)
+            return bool(readable) and self.connection.recv(1, socket.MSG_PEEK) == b''
+        except (ConnectionError, TimeoutError):
+            return True
+        except (OSError, ValueError):
+            return False
+
     def held(self, body):
         mgr = self.server.mgr
         if mgr.enter():
@@ -1315,16 +1423,25 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, AttributeError):
             pass
         if not stream:
-            err = mgr.acquire()
+            err = mgr.acquire(is_gone=self.client_gone)
+            if err == 'client disconnected':
+                self.close_connection = True
+                return
             if err:
                 return self.fail(503, err)
         else:
             self.start_chunked('text/event-stream')
-            tick = lambda n: self.chunk(b': starting gpu vm (%d s)\n\n' % n)
+            def tick(n):
+                stage = mgr.activity()
+                msg = (': starting gpu vm (%d s) - %s\n\n' % (n, stage)) if stage else (': starting gpu vm (%d s)\n\n' % n)
+                self.chunk(msg.encode('utf-8'))
             try:
                 tick(0)
-                err = mgr.acquire(tick)
+                err = mgr.acquire(tick, is_gone=self.client_gone)
             except OSError:
+                self.close_connection = True
+                return
+            if err == 'client disconnected':
                 self.close_connection = True
                 return
             if err:
@@ -1335,18 +1452,49 @@ class Handler(BaseHTTPRequestHandler):
             mgr.leave()
 
     def forward(self, body, sse=False):
-        """Sends the request through the tunnel and pipes the answer back; sse means 200 and SSE headers were already sent."""
+        """Sends the request through the tunnel and pipes the answer back; cancels upstream within 0.5s if client drops."""
         mgr = self.server.mgr
         headers = {k: v for k, v in self.headers.items() if k.lower() not in HOP}
-        for attempt in range(2):
-            try:
-                conn, resp = http_call(mgr.port, self.command, self.path, body, headers, UPSTREAM_TIMEOUT)
-                break
-            except (OSError, http.client.HTTPException) as e:
-                if attempt == 0 and mgr.tunnel_failed():
-                    continue
-                return self.fail(502, 'upstream unreachable (%s)' % e.__class__.__name__, sse)
+        done, cur_conn, aborted = threading.Event(), [None], [False]
+
+        def watch_client():
+            sock = self.connection
+            while not done.wait(0.5):
+                try:
+                    readable, _, _ = select.select([sock], [], [], 0)
+                    if not readable:
+                        continue
+                    if sock.recv(1, socket.MSG_PEEK) == b'':
+                        aborted[0] = True
+                        abort_upstream(cur_conn[0])
+                        return
+                    return
+                except (ConnectionError, TimeoutError):
+                    aborted[0] = True
+                    abort_upstream(cur_conn[0])
+                    return
+                except (OSError, ValueError):
+                    return
+
+        threading.Thread(target=watch_client, daemon=True).start()
+        conn = None
         try:
+            for attempt in range(2):
+                c = http.client.HTTPConnection('127.0.0.1', mgr.port, timeout=UPSTREAM_TIMEOUT)
+                cur_conn[0] = c
+                try:
+                    c.request(self.command, self.path, body=body, headers=headers)
+                    resp = c.getresponse()
+                    conn = c
+                    break
+                except (OSError, http.client.HTTPException) as e:
+                    c.close()
+                    if aborted[0]:
+                        self.close_connection = True
+                        return
+                    if attempt == 0 and mgr.tunnel_failed():
+                        continue
+                    return self.fail(502, 'upstream unreachable (%s)' % e.__class__.__name__, sse)
             if sse:
                 if resp.status != 200:
                     raw = resp.read()
@@ -1360,9 +1508,14 @@ class Handler(BaseHTTPRequestHandler):
                 self.pipe(resp, True)
                 return
             self.send_response(resp.status, resp.reason)
+            has_acao = False
             for k, v in resp.getheaders():
                 if k.lower() not in HOP:
+                    if k.lower() == 'access-control-allow-origin':
+                        has_acao = True
                     self.send_header(k, v)
+            if not has_acao:
+                self.send_cors()
             n = resp.getheader('Content-Length')
             if n is not None and not resp.chunked:
                 self.send_header('Content-Length', n)
@@ -1375,7 +1528,9 @@ class Handler(BaseHTTPRequestHandler):
         except (OSError, http.client.HTTPException):
             self.close_connection = True
         finally:
-            conn.close()
+            done.set()
+            if conn is not None:
+                conn.close()
 
     def pipe(self, resp, chunked):
         while True:
@@ -1395,6 +1550,20 @@ class Handler(BaseHTTPRequestHandler):
         mgr = self.server.mgr
         if path == '/_llm/status':
             return self.send_json(200, mgr.status())
+        if path == '/_llm/reload' and body is not None:
+            try:
+                updates = json.loads(body) if body else None
+            except ValueError:
+                return self.fail(400, 'invalid JSON', obj=error_obj(400, 'invalid JSON', 'invalid_request_error'))
+            applied, restart_required = apply_hot_settings(updates)
+            try:
+                write_opencode(self.server.server_port)
+            except OSError:
+                pass
+            log('reloaded settings: effort=%s, idle_min=%g, max_hours=%g%s' % (
+                applied['effort'], applied['idle_min'], applied['max_hours'],
+                ' (cold changes require restart)' if restart_required else ''), echo=False)
+            return self.send_json(200, {'applied': applied, 'restart_required': restart_required})
         if path not in ('/_llm/up', '/_llm/down') or body is None:
             return self.fail(404, 'unknown control request', obj=error_obj(404, 'unknown control request', 'not_found_error'))
         self.start_chunked('text/plain; charset=utf-8')
@@ -1417,7 +1586,7 @@ class Handler(BaseHTTPRequestHandler):
                 def tick(n):
                     steps()
                     say('wait %d %s' % (n, mgr.activity()))
-                err = mgr.acquire(tick, every=1)
+                err = mgr.acquire(tick, every=1, explicit=True)
                 if not err:
                     mgr.leave(served=0)
                     steps()
@@ -1466,7 +1635,7 @@ def serve(detached=False):
     if not os.path.exists(KEY_FILE):
         sys.exit('missing %s; run: python3 llm.py setup' % KEY_FILE)
     profile()
-    held = take_lock({'port': PORT, 'detached': detached, 'choice': list(choice()), 'engine': engine_choice()})
+    held = take_lock({'port': PORT, 'detached': detached, 'choice': list(choice())})
     if held:
         sys.exit('llm.py serve is already running (pid %s, port %s)' % (held.get('pid'), held.get('port')))
     try:
@@ -1481,8 +1650,8 @@ def serve(detached=False):
     if os.path.exists(SESSION):
         srv.mgr.adopt()
     threading.Thread(target=srv.mgr.monitor, daemon=True).start()
-    log('serve: http://%s:%d/v1, %s, session %s (idle stop %.1f min, hard stop %.1f h)'
-        % (HOST, PORT, describe(*choice()), NAME, IDLE_MIN, MAX_HOURS))
+    log('serve: http://%s:%d/v1 (%s), %s, session %s (idle stop %.1f min, hard stop %.1f h)'
+        % (HOST, PORT, MODEL_ID, describe(*choice()), NAME, IDLE_MIN, MAX_HOURS))
     try:
         srv.serve_forever(0.5)
     except KeyboardInterrupt:
@@ -1570,17 +1739,13 @@ def yes_no(text):
     return {'y': True, 'yes': True, 'n': False, 'no': False}.get(text)
 
 
-def speed_note(images, context, engine=None):
-    """What the chosen pair runs at, and why a smaller context alone is not faster."""
-    layouts = ENGINE_LAYOUTS[engine or engine_choice()]
-    note = 'about %s tok/s' % layouts[layout(images, context)]['SPEED']
-    if images:
-        return note + ' · smaller contexts work but are not faster'
-    return note + ('' if context <= 131072 else ' · text only up to 131K runs at %s tok/s' % layouts['fast']['SPEED'])
+def speed_note(images, context):
+    """Basalt v0.5.7 speed note: dynamic vision uses 0 MiB idle VRAM and elastic FP8 KV scales on demand."""
+    return 'about %s tok/s · dynamic vision (%s) · elastic FP8 KV' % (ESTIMATED_SPEED, '0 idle VRAM' if images else 'off')
 
 
 def settings_summary():
-    return ' · '.join((ENGINE_NAMES[engine_choice()], describe(*choice()), 'effort %s' % SETTINGS['effort'],
+    return ' · '.join((MODEL_ID, describe(*choice()), 'effort %s' % SETTINGS['effort'],
                        'idle stop %g min' % IDLE_MIN, 'hard stop %g h' % MAX_HOURS,
                        'uncensored' if SETTINGS['uncensor'] else 'original model'))
 
@@ -1589,7 +1754,7 @@ def choose_settings(force=False):
     """On a terminal: the first start asks for each default, later starts show them and Enter keeps them; agents and pipes skip this."""
     global IDLE_MIN, MAX_HOURS
     if not (sys.stdin and sys.stdin.isatty()) or os.environ.get('LLM_YES') == '1':
-        return
+        return None
     if os.path.exists(SETTINGS_FILE) and not force:
         print('%s  %s' % (paint('Settings', 'bold'), settings_summary()))
         try:
@@ -1598,14 +1763,13 @@ def choose_settings(force=False):
             answer = ''
         print()
         if answer.strip().lower() not in ('c', 'change'):
-            return
+            return None
     print('%s  %s\n' % (paint('Settings', 'bold'), paint('Enter keeps the value in brackets', 'dim')))
     old, new = SETTINGS, dict(SETTINGS)
-    new['engine'] = pick('Engine', 'basalt or llama', old.get('engine', 'basalt'), engine_value)
-    new['images'] = pick('Images', 'image input, y or n', 'y' if old['images'] else 'n', yes_no)
+    new['images'] = pick('Images', 'dynamic vision, y or n', 'y' if old['images'] else 'n', yes_no)
     new['context'] = pick('Context', '32K, 64K, 131K or 262K', short_context(context_value(old['context']) or 262144), context_value)
-    print('  %s%s' % (' ' * 12, paint(speed_note(new['images'], new['context'], new['engine']), 'dim')))
-    new['effort'] = pick('Effort', 'ds41: 1-100, low, high, max', old['effort'], effort_value)
+    print('  %s%s' % (' ' * 12, paint(speed_note(new['images'], new['context']), 'dim')))
+    new['effort'] = pick('Effort', '1-100, low, high, max', old['effort'], effort_value)
     new['idle_min'] = pick('Idle stop', 'minutes, 1-120', old['idle_min'], lambda t: number(t, 1, 120))
     new['max_hours'] = pick('Hard stop', 'hours, 1-24', old['max_hours'], lambda t: number(t, 1, 24))
     new['uncensor'] = pick('Model', 'y uncensored, n original', 'y' if old['uncensor'] else 'n', yes_no)
@@ -1615,15 +1779,30 @@ def choose_settings(force=False):
     IDLE_MIN = float(os.environ.get('LLM_IDLE_MIN') or new['idle_min'])
     MAX_HOURS = float(os.environ.get('LLM_MAX_HOURS') or new['max_hours'])
     print('\n  %s Saved%s\n' % (paint(glyph('✓', '+'), 'green'), paint(' · change them later: %s settings' % cli(), 'dim')))
+    return new
+
+
+def format_telemetry(b):
+    if not isinstance(b, dict):
+        return ''
+    parts = []
+    if b.get('busy') and b.get('live_tok_s') is not None:
+        parts.append('%.1f tok/s' % b['live_tok_s'])
+    elif b.get('last_tok_s') is not None:
+        parts.append('%.1f tok/s' % b['last_tok_s'])
+    if b.get('hit_rate') is not None:
+        parts.append('hit %.0f%%' % (b['hit_rate'] * 100))
+    if b.get('pcie_share') is not None:
+        parts.append('pcie %.1f%%' % (b['pcie_share'] * 100))
+    return ' · '.join(parts)
 
 
 def watch(port):
-    """Live view until Ctrl+C: one status line with the idle countdown, plus a line for each start and stop."""
+    """Live view until Ctrl+C: GPU status, live Basalt telemetry, idle countdown, and CU cost."""
     if not TTY[0]:
         return
     print(paint('\n  Ctrl+C closes this view; the endpoint keeps running.\n', 'dim'))
     live, prev, dots = Live(), None, (glyph('●', '*'), glyph('◌', '~'), glyph('○', 'o'))
-    eta = '2-3 minutes' if profile().get('ENGINE') == 'basalt' else '4 minutes'
     try:
         while True:
             try:
@@ -1642,12 +1821,14 @@ def watch(port):
                 left = min(st['idle_stop_min'] * 60 - st['idle_s'], st['max_hours'] * 3600 - (st['ran'] or 0))
                 doing = ('answering %d request%s' % (st['active'], '' if st['active'] == 1 else 's') if st['active']
                          else 'idle %s · stops in %s' % (mmss(st['idle_s']), mmss(left)))
-                live.put([('  ', ()), (dots[0] + ' GPU running', ('green', 'bold')), ('   ' + doing + '   ', ()), (spent, ('dim',))])
+                perf = format_telemetry(st.get('basalt'))
+                tail = ' · '.join(p for p in (perf, spent) if p)
+                live.put([('  ', ()), (dots[0] + ' GPU running', ('green', 'bold')), ('   ' + doing + '   ', ()), (tail, ('dim',))])
             elif state in ('starting', 'stopping'):
                 what = 'starting · ' + st['stage'] if state == 'starting' else 'stopping'
                 live.put([('  ', ()), (dots[1] + ' GPU ' + what, ('cyan',)), ('   ' + spent, ('dim',))])
             else:
-                live.put([('  ', ()), (dots[2] + ' GPU off', ('bold',)), ('   starts on the next request, about ' + eta, ('dim',))])
+                live.put([('  ', ()), (dots[2] + ' GPU off', ('bold',)), ('   starts on the next request, about 2-3 minutes', ('dim',))])
             time.sleep(1)
     except KeyboardInterrupt:
         live.clear()
@@ -1756,32 +1937,39 @@ def setup():
 def write_opencode(port=PORT):
     info = profile()
     image = {'attachment': True, 'modalities': {'input': ['text', 'image'], 'output': ['text']}} if info['MMPROJ'] == '1' else {}
-    models = {m: dict({'name': 'DeepSeek-V4.1-Flash uncensored, reasoning effort %s' % e, 'tool_call': True, 'reasoning': True,
-                       'interleaved': {'field': 'reasoning_content'}, 'options': {'reasoningEffort': e},
-                       'limit': {'context': int(info['CTX']) // 2, 'output': 32768}}, **image) for m, e in model_efforts()}
+    models = {MODEL_ID: dict({'name': 'DeepSeek-V4.1-Flash UD-IQ1_M (Basalt, effort %s)' % SETTINGS['effort'],
+                              'tool_call': True, 'reasoning': True,
+                              'interleaved': {'field': 'reasoning_content'},
+                              'options': {'reasoningEffort': str(SETTINGS['effort'])},
+                              'limit': {'context': int(info['CTX']) // 2, 'output': 32768}}, **image)}
     cfg = {'$schema': 'https://opencode.ai/config.json',
-           'provider': {'ds41': {'npm': '@ai-sdk/openai-compatible', 'name': 'DeepSeek-V4.1-Flash on Colab',
+           'provider': {'ds41': {'npm': '@ai-sdk/openai-compatible', 'name': 'DeepSeek-V4.1-Flash on Colab (Basalt)',
                                  'options': {'baseURL': 'http://%s:%d/v1' % (HOST, port), 'apiKey': '{file:%s}' % KEY_FILE.replace('\\', '/'),
                                              'headerTimeout': 1800000, 'chunkTimeout': 900000},
                                  'models': models}},
-           'model': 'ds41/ds41', 'small_model': 'ds41/ds41'}
+           'model': 'ds41/' + MODEL_ID, 'small_model': 'ds41/' + MODEL_ID}
     with open(os.path.join(STATE, 'opencode.json'), 'w') as f:
         json.dump(cfg, f, indent=2)
 
 
 def endpoint_info(port, bal=None):
-    info, me_cmd, eng = profile(), cli(), engine_choice()
-    rows = (('Base URL', 'http://%s:%d/v1' % (HOST, port)), ('API key', api_key()),
-            ('Engine', ENGINE_NAMES[eng]),
-            ('Models', 'ds41 (effort %s) · ds41-max (effort max)' % SETTINGS['effort']),
-            ('Context', '%s tokens per request · image input %s · about %s tok/s' % (
-                '{:,}'.format(int(info['CTX']) // 2), 'on' if info['MMPROJ'] == '1' else 'off',
-                ENGINE_LAYOUTS[eng][layout(*choice())]['SPEED'])))
+    info, me_cmd = profile(), cli()
+    rows = (('Web UI', 'http://%s:%d/' % (HOST, port)),
+            ('Base URL', 'http://%s:%d/v1' % (HOST, port)),
+            ('API key', api_key()),
+            ('Model', '%s (effort %s)' % (MODEL_ID, SETTINGS['effort'])),
+            ('Context', '%s tokens/slot (2 slots) · dynamic vision %s · ~%s tok/s' % (
+                '{:,}'.format(int(info['CTX']) // 2), 'on' if info['MMPROJ'] == '1' else 'off', ESTIMATED_SPEED)))
     print()
     for name, value in rows:
         print('  %-10s %s' % (name, paint(value, 'bold')))
     print()
-    for name, value in (('Try it', me_cmd + ' ask "Hello!"'), ('opencode', me_cmd + ' opencode [project folder]'), ('Stop', me_cmd + ' down')):
+    for name, value in (('Try it', me_cmd + ' ask "Hello!"'),
+                        ('Claude', me_cmd + ' claude'),
+                        ('Codex', me_cmd + ' codex'),
+                        ('opencode', me_cmd + ' opencode [project folder]'),
+                        ('Shell env', 'eval "$(%s env)"' % me_cmd),
+                        ('Stop', me_cmd + ' down')):
         print('  %-10s %s' % (name, paint(value, 'cyan')))
     print('\n' + paint('  About %.0f compute units per hour%s · stops after %s without requests'
                        % (G4_CU_PER_HOUR, ' · balance %.1f' % bal if bal is not None else '', minutes(IDLE_MIN)), 'dim'))
@@ -1803,13 +1991,11 @@ def cmd_setup():
 
 
 def cmd_up():
-    print(paint('DeepSeek V4.1 Flash on Colab', 'bold') + '\n')
+    print(paint('DeepSeek V4.1 Flash on Colab (Basalt v0.5.7)', 'bold') + '\n')
     bal = setup()
     held = serve_running()
-    if held and (held.get('choice') != list(choice()) or held.get('engine', 'basalt') != engine_choice()):
+    if held and held.get('choice') != list(choice()):
         have = describe(*held['choice']) if held.get('choice') else 'other settings'
-        if held.get('engine'):
-            have = ENGINE_NAMES.get(held['engine'], held['engine']) + ' · ' + have
         sys.exit('The endpoint runs with %s. To change that, stop it first: %s down' % (have, cli()))
     if bal < MIN_BALANCE and not (held and load_session()):
         sys.exit('Colab balance %.2f compute units is below LLM_MIN_BALANCE %.0f' % (bal, MIN_BALANCE))
@@ -1824,8 +2010,7 @@ def cmd_up():
             time.sleep(0.3)
             held = serve_running()
     conn, r = control_call(held['port'], '/_llm/up', {}, 120)
-    eta = '2-3 minutes' if profile().get('ENGINE') == 'basalt' else '4 minutes'
-    kind, rest = follow(r, paint('Starting a Colab G4 GPU', 'bold') + paint(' · about ' + eta, 'dim'))
+    kind, rest = follow(r, paint('Starting a Colab G4 GPU', 'bold') + paint(' · about 2-3 minutes', 'dim'))
     conn.close()
     if kind != 'READY':
         print(paint('Start failed: ' + (rest or 'the local endpoint closed the connection'), 'red'))
@@ -1878,8 +2063,13 @@ def cmd_status():
                 gpu = '%s, idle %s of %s, %d request%s served, ran %s, %s' % (
                     st['state'], mmss(st['idle_s']), minutes(st['idle_stop_min']), st['served'], '' if st['served'] == 1 else 's',
                     mmss(st['ran'] or 0), units(st['cu'] or 0))
-            rows += [('Endpoint', 'http://%s:%d/v1 · %s' % (HOST, held['port'], describe(*held['choice']) if held.get('choice') else '')),
+            rows += [('Web UI', 'http://%s:%d/' % (HOST, held['port'])),
+                     ('Endpoint', 'http://%s:%d/v1 · %s' % (HOST, held['port'], describe(*held['choice']) if held.get('choice') else '')),
+                     ('Model', '%s (effort %s)' % (st.get('model') or MODEL_ID, st.get('effort', SETTINGS['effort']))),
                      ('GPU', gpu)]
+            perf = format_telemetry(st.get('basalt'))
+            if perf:
+                rows.append(('Telemetry', perf))
             if st.get('last_error'):
                 rows.append(('Last error', st['last_error']))
         except (OSError, ValueError, KeyError, http.client.HTTPException) as e:
@@ -1904,11 +2094,22 @@ def cmd_logs():
 
 
 def cmd_settings():
-    if serve_running():
-        sys.exit('The endpoint is running with: %s\nStop it first to change them: %s down' % (settings_summary(), cli()))
     if not (sys.stdin and sys.stdin.isatty()):
         sys.exit('Settings: %s\nChange them in a terminal, or edit %s' % (settings_summary(), SETTINGS_FILE))
-    choose_settings(force=True)
+    updated = choose_settings(force=True)
+    held = serve_running()
+    if updated and held:
+        try:
+            conn, r = control_call(held['port'], '/_llm/reload', updated, 10)
+            res = json.loads(r.read())
+            conn.close()
+            ap = res.get('applied') or {}
+            print('  %s Applied live (effort %s · idle stop %g min · hard stop %g h)' % (
+                paint(glyph('✓', '+'), 'green'), ap.get('effort'), ap.get('idle_min'), ap.get('max_hours')))
+            if res.get('restart_required'):
+                print(paint('  Images / context / uncensor changes will apply on the next GPU start (%s down && %s up).' % (cli(), cli()), 'dim'))
+        except (OSError, ValueError, http.client.HTTPException) as e:
+            print(paint('  Saved to disk, but live reload failed (%s).' % e, 'red'))
 
 
 def cmd_watch():
@@ -1920,22 +2121,82 @@ def cmd_watch():
     watch(held['port'])
 
 
+def parse_ask_args(words):
+    """Parses ask CLI arguments: --max, --effort VAL, --image PATH (repeatable), and prompt text."""
+    effort, images, rest = None, [], []
+    i = 0
+    while i < len(words):
+        w = words[i]
+        if w == '--max':
+            effort = 'max'
+        elif w == '--effort' and i + 1 < len(words):
+            i += 1
+            effort = effort_value(words[i]) or sys.exit('invalid --effort %r (use 1-100, low, high, max)' % words[i])
+        elif w == '--image' and i + 1 < len(words):
+            i += 1
+            images.append(words[i])
+        else:
+            rest.append(w)
+        i += 1
+    return effort, images, ' '.join(rest).strip()
+
+
+def encode_image_url(path):
+    if not os.path.isfile(path):
+        sys.exit('image file not found: %s' % path)
+    mime = mimetypes.guess_type(path)[0] or 'image/png'
+    with open(path, 'rb') as f:
+        b64 = base64.b64encode(f.read()).decode('ascii')
+    return 'data:%s;base64,%s' % (mime, b64)
+
+
+def read_piped_stdin(has_prompt):
+    """Reads piped stdin; when a CLI prompt is already given, never blocks on an idle non-TTY stdin."""
+    if not sys.stdin or sys.stdin.isatty():
+        return ''
+    if has_prompt:
+        if IS_WIN:
+            return ''
+        try:
+            rlist, _, _ = select.select([sys.stdin], [], [], 0.05)
+            if not rlist:
+                return ''
+        except (OSError, ValueError):
+            return ''
+    return sys.stdin.read().strip()
+
+
 def cmd_ask(words):
     held = serve_running()
     if not held:
         sys.exit('The endpoint is not running. Start it first: %s up' % cli())
-    model = 'ds41-max' if '--max' in words else 'ds41'
-    body = {'model': model, 'stream': True, 'messages': [{'role': 'user', 'content': ' '.join(w for w in words if w != '--max') or 'Hello!'}]}
+    effort, images, prompt = parse_ask_args(words)
+    piped = read_piped_stdin(bool(prompt or images))
+    if piped and prompt:
+        prompt = piped + '\n\n' + prompt
+    elif piped:
+        prompt = piped
+    elif not prompt:
+        prompt = 'Describe this image.' if images else 'Hello!'
+    if images:
+        content = [{'type': 'text', 'text': prompt}] + [{'type': 'image_url', 'image_url': {'url': encode_image_url(p)}} for p in images]
+    else:
+        content = prompt
+    body = {'model': MODEL_ID, 'stream': True, 'stream_options': {'include_usage': True},
+            'messages': [{'role': 'user', 'content': content}]}
+    if effort:
+        body['reasoning_effort'] = effort
+    t_req = time.time()
     conn, r = http_call(held['port'], 'POST', '/v1/chat/completions', json.dumps(body).encode(),
                         {'Authorization': 'Bearer ' + api_key(), 'Content-Type': 'application/json'}, UPSTREAM_TIMEOUT, HOST)
     if r.status != 200:
         sys.exit('HTTP %d: %s' % (r.status, r.read()[:500].decode('utf-8', 'replace')))
-    live, part, timings = Live(), None, None
+    live, part, timings, usage_obj, t_first, chunks_seen = Live(), None, None, None, None, 0
     for raw in r:
         line = raw.decode('utf-8', 'replace').strip()
-        wait = re.match(r': starting gpu vm \((\d+) s\)', line)
+        wait = re.match(r': starting gpu vm \((\d+) s\)(?: - (.*))?', line)
         if wait:
-            live.show(mmss(wait.group(1)), 'starting the GPU, about 2-3 minutes')
+            live.show(mmss(wait.group(1)), wait.group(2) or 'starting the GPU, about 2-3 minutes')
         if not line.startswith('data: {'):
             continue
         event = json.loads(line[6:])
@@ -1943,11 +2204,18 @@ def cmd_ask(words):
             live.clear()
             sys.exit('\nerror: %s' % event['error'].get('message', event['error']))
         timings = event.get('timings') or timings
-        for choice in event.get('choices', []):
-            delta = choice.get('delta') or {}
+        if event.get('usage'):
+            usage_obj = event['usage']
+        for ch in event.get('choices', []):
+            delta = ch.get('delta') or {}
             # the reasoning is shown dimmed on a terminal and left out on a pipe
             for kind, text in (('think', delta.get('reasoning_content')), ('say', delta.get('content'))):
-                if not text or (kind == 'think' and not TTY[0]):
+                if not text:
+                    continue
+                if t_first is None:
+                    t_first = time.time()
+                chunks_seen += 1
+                if kind == 'think' and not TTY[0]:
                     continue
                 live.clear()
                 if part not in (None, kind):
@@ -1955,10 +2223,17 @@ def cmd_ask(words):
                 part = kind
                 sys.stdout.write(paint(text, 'dim') if kind == 'think' else text)
                 sys.stdout.flush()
+    t_end = time.time()
     conn.close()
     print()
-    if timings and timings.get('predicted_n'):
-        print(paint('%s: %d tokens at %.1f tokens/s' % (model, timings['predicted_n'], timings.get('predicted_per_second', 0)), 'dim'))
+    if TTY[0]:
+        if timings and timings.get('predicted_n'):
+            print(paint('%s: %d tokens at %.1f tok/s' % (MODEL_ID, timings['predicted_n'], timings.get('predicted_per_second', 0)), 'dim'))
+        elif usage_obj and usage_obj.get('completion_tokens') and t_first is not None:
+            n = int(usage_obj['completion_tokens'])
+            dec_s = max(0.001, t_end - t_first)
+            ttft = max(0.0, t_first - t_req)
+            print(paint('%s: %d tokens · TTFT %.2fs · %.1f tok/s' % (MODEL_ID, n, ttft, n / dec_s), 'dim'))
 
 
 def find_opencode():
@@ -1969,17 +2244,66 @@ def find_opencode():
 
 
 def cmd_opencode(args):
-    exe = find_opencode()
-    if not exe:
-        sys.exit('opencode is not installed. Get it from https://opencode.ai, then run this again.')
     held = serve_running()
     if not held:
         sys.exit('The endpoint is not running. Start it first: %s up' % cli())
+    exe = find_opencode()
+    if not exe:
+        sys.exit('opencode is not installed. Get it from https://opencode.ai, then run this again.')
     if held.get('choice'):
-        os.environ.pop('LLM_PROFILE', None)
         os.environ['LLM_IMAGES'], os.environ['LLM_CONTEXT'] = '1' if held['choice'][0] else '0', str(held['choice'][1])
     write_opencode(held['port'])
     sys.exit(subprocess.call([exe] + args, env=dict(os.environ, OPENCODE_CONFIG=os.path.join(STATE, 'opencode.json'))))
+
+
+def client_env_vars(port):
+    base = 'http://%s:%d' % (HOST, port)
+    key = api_key()
+    return (
+        ('OPENAI_BASE_URL', base + '/v1'),
+        ('OPENAI_API_KEY', key),
+        ('OPENAI_MODEL', MODEL_ID),
+        ('ANTHROPIC_BASE_URL', base),
+        ('ANTHROPIC_API_KEY', key),
+        ('ANTHROPIC_AUTH_TOKEN', key),
+        ('ANTHROPIC_MODEL', MODEL_ID),
+        ('ANTHROPIC_SMALL_FAST_MODEL', MODEL_ID),
+    )
+
+
+def cmd_claude(args):
+    held = serve_running()
+    if not held:
+        sys.exit('The endpoint is not running. Start it first: %s up' % cli())
+    exe = shutil.which('claude')
+    if not exe:
+        sys.exit('claude is not installed. Install Claude Code (https://docs.anthropic.com/en/docs/claude-code), then run this again.')
+    env = dict(os.environ, **dict(client_env_vars(held['port'])), CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC='1')
+    sys.exit(subprocess.call([exe] + args, env=env))
+
+
+def cmd_codex(args):
+    held = serve_running()
+    if not held:
+        sys.exit('The endpoint is not running. Start it first: %s up' % cli())
+    exe = shutil.which('codex')
+    if not exe:
+        sys.exit('codex is not installed. Install Codex CLI (npm i -g @openai/codex), then run this again.')
+    env = dict(os.environ, **dict(client_env_vars(held['port'])))
+    sys.exit(subprocess.call([exe] + args, env=env))
+
+
+def cmd_env(args):
+    if not os.path.exists(KEY_FILE):
+        sys.exit('missing %s; run: %s setup' % (KEY_FILE, cli()))
+    held = serve_running()
+    port = held['port'] if held else PORT
+    ps = '--powershell' in args or (IS_WIN and '--sh' not in args)
+    for k, v in client_env_vars(port):
+        if ps:
+            print("$env:%s = '%s'" % (k, v.replace("'", "''")))
+        else:
+            print("export %s=%s" % (k, shlex.quote(v)))
 
 
 def main():
@@ -1987,17 +2311,15 @@ def main():
     cmd = args[0] if args else 'help'
     if sys.stdout is not None and hasattr(sys.stdout, 'reconfigure'):
         sys.stdout.reconfigure(errors='replace')
-    if '--fast' in args and cmd not in ('ask', 'opencode'):
-        os.environ['LLM_PROFILE'] = CHILD_ENV['LLM_PROFILE'] = 'fast'
-    if '--basalt' in args and cmd not in ('ask', 'opencode'):
-        os.environ['LLM_ENGINE'] = CHILD_ENV['LLM_ENGINE'] = 'basalt'
-    elif '--llama' in args and cmd not in ('ask', 'opencode'):
-        os.environ['LLM_ENGINE'] = CHILD_ENV['LLM_ENGINE'] = 'llama'
+    if '--wait-gpu' in args and cmd in ('up', 'serve'):
+        os.environ['LLM_WAIT_GPU'] = CHILD_ENV['LLM_WAIT_GPU'] = '1'
     os.makedirs(STATE, mode=0o700, exist_ok=True)
     init_console()
     commands = {'up': cmd_up, 'down': lambda: cmd_down('--all' in args), 'status': cmd_status, 'logs': cmd_logs, 'setup': cmd_setup,
                 'settings': cmd_settings, 'watch': cmd_watch,
-                'ask': lambda: cmd_ask(args[1:]), 'opencode': lambda: cmd_opencode(args[1:])}
+                'ask': lambda: cmd_ask(args[1:]), 'claude': lambda: cmd_claude(args[1:]),
+                'codex': lambda: cmd_codex(args[1:]), 'opencode': lambda: cmd_opencode(args[1:]),
+                'env': lambda: cmd_env(args[1:])}
     try:
         if cmd == 'serve':
             serve('--detached' in args)

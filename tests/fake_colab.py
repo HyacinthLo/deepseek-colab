@@ -32,8 +32,7 @@ def vm(name):
 
 
 def rewrite(cmd, name):
-    """Maps VM paths into the fake VM dir and swaps gcc and boot.sh for harmless stand-ins; refuses anything else heavy."""
-    cmd = cmd.replace('gcc -shared -fPIC -O2 -o vm/libpin.so vm/pin.c -ldl -lpthread', 'cp vm/pin.c vm/libpin.so')
+    """Maps VM paths into the fake VM dir and swaps boot.sh for a harmless stand-in; refuses anything else heavy."""
     cmd = cmd.replace('bash vm/boot.sh', '%s %s' % (sys.executable, os.path.join(TESTS, 'fake_boot.py')))
     cmd = cmd.replace('/content', os.path.join(vm(name), 'content')).replace('/root/', os.path.join(vm(name), 'root') + '/')
     if any(re.search(r'(^|[\s;&(])%s\b' % w, cmd) for w in REFUSE):
@@ -73,6 +72,14 @@ def main():
         if name in s:
             print('[colab] Session %s already exists.' % name)
             return 1
+        fail_n = int(os.environ.get('FAKE_ALLOC_FAILS', '0') or '0')
+        if fail_n > 0:
+            cnt_path = os.path.join(D, 'alloc_fails.txt')
+            seen = int(open(cnt_path).read().strip()) if os.path.exists(cnt_path) else 0
+            if seen < fail_n:
+                open(cnt_path, 'w').write(str(seen + 1))
+                print('[colab] Error: no G4 backend currently available', file=sys.stderr)
+                return 1
         os.makedirs(os.path.join(vm(name), 'content'), exist_ok=True)
         os.makedirs(os.path.join(vm(name), 'root'), exist_ok=True)
         s[name] = {'created': time.time(), 'gpu': rest[rest.index('--gpu') + 1] if '--gpu' in rest else None}
