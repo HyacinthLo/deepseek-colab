@@ -23,3 +23,4 @@ patch_dma.py
 patch_dmaalign.py
 patch_opt_upstream.py
 patch_opt_dma.py
+patch_opt_shexp_overlap.py
