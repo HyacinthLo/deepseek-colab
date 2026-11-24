@@ -701,7 +701,7 @@ class UnitTests(unittest.TestCase):
             envs = L.boot_env()
             self.assertIn("WEIGHTS='unsloth'", envs)
             self.assertIn("MOE_CACHE_MIB='70200'", envs)
-            self.assertIn("DMA='0'", envs)
+            self.assertIn("DMA='1'", envs)
             os.environ['LLM_PROFILE'] = 'fast'
             envs_fast = L.boot_env()
             self.assertIn("MOE_CACHE_MIB='74000'", envs_fast)

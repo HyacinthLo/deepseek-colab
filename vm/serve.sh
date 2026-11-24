@@ -14,10 +14,10 @@ if [ "${MMPROJ:-0}" = 1 ]; then  # image encoder on local disk (the RAM disk has
 fi
 BIN=/content/llama/bin/llama-server
 export LLAMA_MOE_DEVCACHE=1 GGML_CUDA_HCFUSE=1 GGML_SCHED_ASYNC_INPUTS=1 GGML_CUDA_GRAPH_FIRST_CHUNK=32 LLAMA_KV_SEQRM_INDEX=1 GGML_CUDA_MOE_COPY_ALIGN=1
-if [ "$MMPROJ" = 1 ] || [ "${DMA:-0}" != 1 ]; then  # misses by the copy engine stall on image prompts and were measured only in the fast layout
+if [ "${DMA:-0}" != 1 ]; then  # ISTA default layout keeps DMA=0; Unsloth default + fast layouts enable DMA=1 (verified with mmproj)
   export LLAMA_MOE_DEVCACHE_DMA=0
 else
-  export LLAMA_MOE_DEVCACHE_DMA=1 CUDA_DEVICE_MAX_CONNECTIONS=32
+  export LLAMA_MOE_DEVCACHE_DMA=1 LLAMA_MOE_DEVCACHE_DMA_BATCH=1 LLAMA_MOE_DEVCACHE_DMA_OVERLAP=1 CUDA_DEVICE_MAX_CONNECTIONS=32
 fi
 MODEL_FIRST=${MODEL_FIRST:-/content/model/DeepSeek-V4.1-Flash-1017-GSQ-RCO-$RUNG-00001-of-00006.gguf}
 ARGS=(-m "$MODEL_FIRST" -a ds41,ds41-max --host 127.0.0.1 --port $PORT
