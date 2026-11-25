@@ -1,0 +1,14 @@
+{
+  "basalt_repo": "https://github.com/jesdga95/basalt.git",
+  "basalt_tag": "v0.5.7",
+  "basalt_commit": "400b411c58031d064812ea21a259b2381acdaa3e",
+  "prebuilt_url": "https://github.com/HyacinthLo/basalt-colab/releases/download/prebuilt-v0.5.7/basalt-v0.5.7-deepseek41-sm120-linux-x64.tar.gz",
+  "prebuilt_sha256": "",
+  "pack_url": "https://huggingface.co/jesdga/DeepSeek-V4.1-Flash-1017-Basalt/resolve/main/DeepSeek-V4.1-Flash-1017-UD-IQ1_M.basalt",
+  "pack_model_id": "DeepSeek-V4.1-Flash-1017-UD-IQ1_M",
+  "abliteration_url": "https://huggingface.co/mrfakename/DeepSeek-V4.1-Flash-1017-abliterated/resolve/4433164758a8045b1b915b7644cce97b9a0e274c/abliteration-edit.npz",
+  "abliteration_sha256": "83273cdbe06e65ad2852dd09e8d976a0e8ce3209788938add325989c20b63b02",
+  "colab_cli": "google-colab-cli==0.7.5",
+  "g4_cu_per_hour": 8.9,
+  "estimated_speed_tok_s": 160.4
+}

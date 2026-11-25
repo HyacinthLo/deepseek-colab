@@ -1,14 +1,17 @@
 #!/bin/bash
-# Cold start on a Colab G4 using Basalt v0.5.7 (DeepSeek-V4.1-Flash UD-IQ1_M):
-#   1. Parallel: build Basalt (~80s) + fetch sparse backbone into /mnt/ram (~50s) + fetch abliteration edit
+# Cold start on Colab G4 using Basalt v0.5.7 (DeepSeek-V4.1-Flash UD-IQ1_M):
+#   1. Parallel: fetch/build patched Basalt + fetch 139.1 GiB sparse backbone into /mnt/ram + fetch 43 KB abliteration edit
 #   2. In-place abliteration via standalone abliterate (~1.5s, 62/62 tensors)
-#   3. Start basalt serve + POST /load (with BASALT_PUNCH_FILE punch-on-read reclaiming ~140 GiB tmpfs in ~12s!)
-#   4. Fetch 110.6 GB Engram into /mnt/ram/engram.bin (~34s @ 3.2 GB/s)
-#   5. Warmup + open gate.py on port 18080 (~2.4 min VM boot!)
+#   3. Start basalt serve + POST /load (punch-on-read reclaims ~140 GiB tmpfs in ~12s)
+#   4. Stream 110.6 GB Engram into /mnt/ram/engram.bin (~32s @ 3.2 GB/s)
+#   5. Warmup + open gate.py on :18080 + arm VM-side hard-cap backstop
 set -uo pipefail
-: "${CTX:?} ${MMPROJ:?}"
-export QUANT=${QUANT:-iq1_m} PORT=18081 DRAFT=${DRAFT:-1} UNCENSOR=${UNCENSOR:-1} WORKERS=${WORKERS:-64}
-export VRAM_RESERVE=${VRAM_RESERVE:-700} RAM_BUDGET=${RAM_BUDGET:-55} DRAFT_EXPERTS=${DRAFT_EXPERTS:-32}
+: "${CTX:?}"
+export PORT=18081 UNCENSOR=${UNCENSOR:-1} WORKERS=${WORKERS:-64}
+export PARALLEL=${PARALLEL:-2} KV_TYPE=${KV_TYPE:-fp8} VISION_MODE=${VISION_MODE:-dynamic}
+export SPEC_MAX=${SPEC_MAX:-6} DRAFT_EXPERTS=${DRAFT_EXPERTS:-32}
+export VRAM_RESERVE=${VRAM_RESERVE:-700} RAM_BUDGET=${RAM_BUDGET:-55}
+export CONV_CACHE_MIB=${CONV_CACHE_MIB:-32768}
 export MODEL_ALIAS=${MODEL_ALIAS:-DeepSeek-V4.1-Flash-1017-UD-IQ1_M}
 [ -s /content/secrets/hf_hdr ] && export HF_HDR=/content/secrets/hf_hdr
 R=/content/res; V=/content/vm; D=/content/basalt
@@ -20,15 +23,25 @@ st() { echo "$(( $(date +%s) - T0 ))s $(date +%T) $*" >> $R/timeline.txt; }
 seen() { grep -qE "$1" $R/timeline.txt; }
 hdr() { echo "Authorization: Bearer $(cat /content/secrets/key)"; }
 
-ABLIT_URL=https://huggingface.co/mrfakename/DeepSeek-V4.1-Flash-1017-abliterated/resolve/4433164758a8045b1b915b7644cce97b9a0e274c/abliteration-edit.npz
-ABLIT_SHA=83273cdbe06e65ad2852dd09e8d976a0e8ce3209788938add325989c20b63b02
+# Read pinned URLs & SHA-256 from $V/manifest.json
+eval "$(python3 - "$V/manifest.json" <<'EOF'
+import json, shlex, sys
+m = json.load(open(sys.argv[1]))
+for env_k, json_k in (
+    ("ABLIT_URL", "abliteration_url"),
+    ("ABLIT_SHA", "abliteration_sha256"),
+    ("MANIFEST_PREBUILT_URL", "prebuilt_url"),
+    ("MANIFEST_PREBUILT_SHA", "prebuilt_sha256"),
+):
+    print(f"export {env_k}={shlex.quote(str(m.get(json_k, '')))}")
+EOF
+)"
 
-st "boot start engine=basalt model=$MODEL_ALIAS quant=$QUANT ctx=$CTX images=$MMPROJ draft=$DRAFT uncensored=$UNCENSOR"
+st "boot start engine=basalt model=$MODEL_ALIAS ref=${BASALT_REF:-pinned} ctx=$CTX parallel=$PARALLEL kv=$KV_TYPE vision=$VISION_MODE uncensored=$UNCENSOR"
 RAM_GB=$(( $(awk '/MemTotal/ {print $2}' /proc/meminfo) / 1000000 - 6 ))
 mountpoint -q /mnt/ram || mount -t tmpfs -o size=${RAM_GB}G tmpfs /mnt/ram
 
-# UD-IQ1_M backbone (139.1 GiB) fits in /mnt/ram with punch-on-read; fall back to /content disk on smaller-RAM VMs.
-if [ "$QUANT" = iq1_m ] && [ "$RAM_GB" -ge 162 ]; then
+if [ "$RAM_GB" -ge 162 ]; then
   export MODEL_PATH=/mnt/ram/model.basalt
   export BASALT_PUNCH_FILE=/mnt/ram/model.basalt
 else
@@ -37,7 +50,7 @@ else
 fi
 export ENGRAM_PATH=/mnt/ram/engram.bin
 
-python3 $V/basalt_jobs.py --quant "$QUANT" \
+python3 $V/basalt_jobs.py --quant iq1_m \
   --backbone-dest "$MODEL_PATH" --backbone-jobs "$R/j_basalt_bb.json" \
   --engram-dest "$ENGRAM_PATH" --engram-jobs "$R/j_basalt_eng.json" \
   --engram-size-out "$R/engram_size.txt" > $R/fetch.log 2>&1 || { st "basalt_jobs FAILED"; exit 1; }
@@ -50,7 +63,7 @@ if [ "$UNCENSOR" = 1 ]; then
     && st "abliteration edit fetched" || st "abliteration edit FAILED"; } &
 fi
 { python3 $V/pfetch.py $R/j_basalt_bb.json --workers $WORKERS --chunk-mb 64 --tag basalt-bb --log $R/fetch.log \
-  && st "backbone fetched (basalt $QUANT)" || st "backbone FAILED"; } &
+  && st "backbone fetched (basalt iq1_m)" || st "backbone FAILED"; } &
 wait
 seen FAILED && { st "fetch/build FAILED, stopping"; exit 1; }
 
@@ -59,7 +72,7 @@ if [ "$UNCENSOR" = 1 ]; then
     > $R/patch.log 2>&1 && st "abliteration applied" || { st "abliteration FAILED ($(tail -1 $R/patch.log 2>/dev/null))"; exit 1; }
 fi
 
-# Create 0-block sparse engram.bin so PleReader::open succeeds before we fill it after punch-on-read
+# Create 0-block sparse engram.bin so PleReader::open succeeds before Engram download
 python3 -I -c "import os; f=os.open('$ENGRAM_PATH', os.O_WRONLY|os.O_CREAT, 0o644); os.ftruncate(f, int('$ENGRAM_SIZE')); os.close(f)"
 
 bash $V/serve.sh
@@ -70,7 +83,7 @@ for k in $(seq 1 120); do
   sleep 0.5
 done
 
-# Trigger eager weight load (without running any token so PleReader RowCache stays empty before Engram download)
+# Eager weight load (with punch-on-read reclaiming ~140 GiB tmpfs before Engram download)
 curl -sf --max-time 900 -X POST -H "$(hdr)" -H "Content-Type: application/json" -d '{}' \
   http://127.0.0.1:$PORT/load > $R/load.json 2>&1 && st "weights loaded" || { st "weights load FAILED ($(tail -5 $R/server.log 2>/dev/null | tr '\n' ' '))"; exit 1; }
 
@@ -83,7 +96,7 @@ if [ -n "${BASALT_PUNCH_FILE:-}" ]; then
 fi
 st "pin: VRAM ${VRAM} MiB, model $(du -sh "$MODEL_PATH" | awk '{print $1}')"
 
-# Fill 110.6 GB Engram table into /mnt/ram/engram.bin now that tmpfs backbone was punched down to ~1.6 GiB
+# Fill 110.6 GB Engram table into /mnt/ram/engram.bin
 ( for k in $(seq 1 600); do [ -f $R/READY ] && exit 0; a=$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo)
     [ "$a" -lt 1200 ] && { for p in $(pgrep -f "[p]fetch.py"); do kill $p; done; st "GUARD: ${a} MiB RAM available, engram fetch stopped FAILED"; exit 0; }; sleep 2; done ) &
 python3 $V/pfetch.py $R/j_basalt_eng.json --workers $WORKERS --chunk-mb 64 --tag basalt-eng --log $R/fetch.log \
@@ -99,7 +112,7 @@ setsid nohup python3 $V/gate.py 18080 $PORT > $R/gate.log 2>&1 < /dev/null &
 for k in $(seq 1 50); do grep -q "gate open" $R/gate.log 2>/dev/null && break; sleep 0.1; done
 grep -q "gate open" $R/gate.log && st "gate open 18080" || st "gate FAILED"
 
-# VM-side hard-cap backstop if the local proxy host sleeps or loses power
+# VM-side hard-cap backstop if the local host sleeps or loses power
 if [ -n "${MAX_HOURS:-}" ]; then
   CAP_S=$(python3 -c "print(max(600, int(float('$MAX_HOURS') * 3600) + 300))" 2>/dev/null || echo 21900)
   setsid bash -c "sleep $CAP_S; pkill -f '[g]ate.py' || true; kill \$(cat $R/server.pid 2>/dev/null) 2>/dev/null || true; rm -rf /content/secrets" > /dev/null 2>&1 < /dev/null &

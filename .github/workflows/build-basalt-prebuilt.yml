@@ -1,0 +1,93 @@
+name: Build Prebuilt Basalt (sm_120, DeepSeek-V4.1-Flash)
+
+on:
+  workflow_dispatch:
+    inputs:
+      basalt_tag:
+        description: "Basalt git tag/ref to build (empty = read basalt_colab/vm/manifest.json)"
+        required: false
+        default: ""
+  push:
+    branches: [main, basalt-native]
+    paths:
+      - "basalt_colab/vm/manifest.json"
+      - "basalt_colab/vm/patch_basalt.py"
+      - "basalt_colab/vm/abliterate.c"
+      - ".github/workflows/build-basalt-prebuilt.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  build-sm120:
+    runs-on: ubuntu-24.04
+    container:
+      image: nvidia/cuda:13.0.0-devel-ubuntu24.04
+    steps:
+      - name: Checkout basalt-colab
+        uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq git cmake ninja-build python3 gcc g++ curl
+
+      - name: Read manifest & clone Basalt
+        id: meta
+        run: |
+          python3 - <<'EOF' >> "$GITHUB_OUTPUT"
+          import json, os
+          m = json.load(open("basalt_colab/vm/manifest.json"))
+          tag = os.environ.get("INPUT_TAG") or m["basalt_tag"]
+          print(f"tag={tag}")
+          print(f"repo={m['basalt_repo']}")
+          print(f"commit={'' if os.environ.get('INPUT_TAG') else m['basalt_commit']}")
+          EOF
+        env:
+          INPUT_TAG: ${{ inputs.basalt_tag }}
+
+      - name: Clone & patch Basalt
+        run: |
+          git clone --depth 1 --branch "${{ steps.meta.outputs.tag }}" "${{ steps.meta.outputs.repo }}" /tmp/basalt
+          if [ -n "${{ steps.meta.outputs.commit }}" ]; then
+            test "$(git -C /tmp/basalt rev-parse HEAD)" = "${{ steps.meta.outputs.commit }}"
+          fi
+          python3 basalt_colab/vm/patch_basalt.py /tmp/basalt
+
+      - name: Build Basalt (sm_120, deepseek41) + standalone abliterate
+        run: |
+          cmake -S /tmp/basalt -B /tmp/basalt/build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CUDA_ARCHITECTURES=120 \
+            -DBASALT_MODELS=deepseek41 \
+            -DBUILD_TESTING=OFF
+          cmake --build /tmp/basalt/build -j "$(nproc)" --target basalt
+          mkdir -p /tmp/dist/bin
+          cp /tmp/basalt/bin/basalt /tmp/dist/bin/basalt
+          gcc -O3 -fopenmp -DABLITERATE_STANDALONE basalt_colab/vm/abliterate.c -lm -o /tmp/dist/abliterate
+          strip /tmp/dist/bin/basalt /tmp/dist/abliterate || true
+
+      - name: Package tarball & SHA-256
+        id: pkg
+        run: |
+          NAME="basalt-${{ steps.meta.outputs.tag }}-deepseek41-sm120-linux-x64.tar.gz"
+          tar -czf "/tmp/$NAME" -C /tmp/dist bin/basalt abliterate
+          SHA=$(sha256sum "/tmp/$NAME" | awk '{print $1}')
+          echo "$SHA  $NAME" > "/tmp/$NAME.sha256"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          echo "sha256=$SHA" >> "$GITHUB_OUTPUT"
+          echo "Packaged $NAME (sha256: $SHA)"
+
+      - name: Publish to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: prebuilt-${{ steps.meta.outputs.tag }}
+          name: Prebuilt Basalt ${{ steps.meta.outputs.tag }} (Colab G4 sm_120)
+          body: |
+            Patched `jesdga95/basalt` `${{ steps.meta.outputs.tag }}` (`-DBASALT_MODELS=deepseek41`, `sm_120`) + standalone `abliterate` binary for Google Colab G4.
+
+            - Archive: `${{ steps.pkg.outputs.name }}`
+            - SHA-256: `${{ steps.pkg.outputs.sha256 }}`
+          files: |
+            /tmp/${{ steps.pkg.outputs.name }}
+            /tmp/${{ steps.pkg.outputs.name }}.sha256

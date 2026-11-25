@@ -27,13 +27,21 @@ import os, sys
 
 def patch_file(src_dir, rel, marker, edits):
     path = os.path.join(src_dir, rel)
+    if not os.path.isfile(path):
+        sys.exit(f'[PATCH FAIL] {marker}: target file missing in Basalt tree: {rel}')
     text = open(path, 'r', encoding='utf-8').read()
     if marker in text:
         print(f'already patched {rel} ({marker})')
         return
-    for old, new in edits:
+    for idx, (old, new) in enumerate(edits, 1):
         count = text.count(old)
-        assert count == 1, f'{rel}: expected 1 match (got {count}) for:\n{old[:220]}'
+        if count != 1:
+            first_line = old.strip().splitlines()[0][:120] if old.strip() else ''
+            sys.exit(
+                f'[PATCH FAIL] {marker} ({rel} edit #{idx}): expected 1 anchor match, got {count} '
+                f'(first line: {first_line!r}). Upstream Basalt may have moved this code; '
+                f'omit --basalt-ref to use the pinned manifest or update patch_basalt.py.'
+            )
         text = text.replace(old, new, 1)
     open(path, 'w', encoding='utf-8').write(text)
     print(f'patched {rel} ({marker})')
