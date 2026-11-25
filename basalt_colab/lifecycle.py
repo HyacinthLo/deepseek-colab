@@ -478,8 +478,25 @@ class Manager:
     def _launch(self) -> dict[str, Any]:
         cfg = self.cfg
         session = cfg.colab.session
-        extra_env = {"BASALT_REF": self._override_ref} if self._override_ref else None
-        env_vars = cfg.boot_vars(extra_env=extra_env)
+        if self._override_quant is not None:
+            from basalt_colab.config import quant_value
+            q = quant_value(self._override_quant)
+            if not q:
+                raise StartError(f"invalid --quant value: {self._override_quant!r}")
+            cfg.basalt.quant = q
+        if self._override_pack_url is not None:
+            cfg.basalt.pack_url = self._override_pack_url.strip()
+        if self._override_uncensor_scale is not None:
+            cfg.basalt.uncensor_scale = float(self._override_uncensor_scale)
+            cfg.basalt.uncensor = cfg.basalt.uncensor_scale > 0.0
+        if self._override_ref is not None:
+            cfg.basalt.ref = self._override_ref.strip()
+        try:
+            from basalt_colab.config import validate_config
+            validate_config(cfg)
+            env_vars = cfg.boot_vars(manifest=self.manifest)
+        except ConfigError as e:
+            raise StartError(str(e))
         try:
             missing = missing_vm_files(self.paths.vm_dir)
         except OSError as e:
@@ -496,6 +513,7 @@ class Manager:
             raise StartError(f"Colab balance {bal:.2f} compute units is below min_balance {cfg.colab.min_balance:.0f}")
         self._check_stop()
         t0 = time.time()
+        model_id = cfg.basalt.effective_model_alias
         s: dict[str, Any] = {
             "name": session,
             "started": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -503,7 +521,8 @@ class Manager:
             "t0": t0,
             "stages": {},
             "serve": me(),
-            "model": cfg.basalt.model_alias,
+            "model": model_id,
+            "quant": cfg.basalt.quant,
             "basalt_ref": env_vars.get("BASALT_REF") or self.manifest.basalt_tag,
             "cold_signature": cfg.cold_signature(),
         }
@@ -512,7 +531,7 @@ class Manager:
         save_session(self.paths, s)
         self.sess = s
         self.logger.log(
-            f"up: {cfg.basalt.model_alias} ({cfg.describe_engine()}), balance {bal:.2f} CU, "
+            f"up: {model_id} ({cfg.describe_engine()}, {cfg.describe_uncensor()}), balance {bal:.2f} CU, "
             f"hard stop {cfg.colab.max_hours:.1f} h, idle stop {cfg.colab.idle_min:.1f} min"
         )
         wait_gpu = cfg.colab.wait_gpu if self._override_wait_gpu is None else self._override_wait_gpu
