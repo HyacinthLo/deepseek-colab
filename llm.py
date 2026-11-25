@@ -511,7 +511,8 @@ def stop_cloud(s, reason):
     """Kills the tunnel, wipes secrets on the VM, stops it and logs the cost; returns True if it is still running."""
     s = s or {'name': NAME}
     kill_rec(s.get('tunnel'))
-    if session_alive():
+    was_alive = session_alive()
+    if was_alive:
         vmx('rm -rf /content/secrets; echo CLEANED', 30)
         for attempt in range(3):
             colab(['stop', '-s', NAME], 120)
@@ -521,7 +522,8 @@ def stop_cloud(s, reason):
     still = session_alive()
     bal, rate = usage()
     # Colab books usage minutes late, so the cost comes from the running time, not from the balance
-    ran = time.time() - s['t0'] if s.get('t0') else None
+    billed = bool(s.get('t0')) and (was_alive or (s.get('stages') or {}).get('allocated') is not None)
+    ran = time.time() - s['t0'] if billed else None
     cu = ran / 3600 * G4_CU_PER_HOUR if ran is not None else None
     log('down (%s): session %s, balance %s CU%s' % (reason, 'STILL ACTIVE, run: llm.py down' if still else 'stopped', bal,
                                                   ', ran %s, about %.2f CU' % (mmss(ran), cu) if ran is not None else ''))
@@ -933,7 +935,8 @@ class Manager:
             log('allocation attempt %d failed: %s' % (attempt + 1, out.strip()[-300:]))
             self._check_stop()
             if attempt + 1 >= max_attempts or time.time() >= deadline:
-                raise StartError('no G4 GPU from Colab (none free, or the plan has no compute units for it): ' + out.strip()[-200:])
+                brief = ' '.join(re.sub(r'[╭╮╰╯─│]+', ' ', out).split())[-200:]
+                raise StartError('no G4 GPU from Colab (none free, or the plan has no compute units for it): ' + brief)
             wait_s = min(60.0, 10.0 * (2 ** min(attempt, 3))) * max(0.02, delay_scale)
             self.alloc_note = 'waiting for G4 GPU (retry %d in %ds)' % (attempt + 2, max(1, int(wait_s)))
             self._sleep_cancelable(wait_s)
