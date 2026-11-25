@@ -36,14 +36,20 @@ class ConfigAndUnitTests(unittest.TestCase):
         m = manifest.load_manifest(self.p.vm_dir)
         self.assertEqual(m.basalt_tag, "v0.5.7")
         self.assertEqual(m.pack_model_id, config.DEFAULT_MODEL_ALIAS)
+        self.assertIsNotNone(m.pack("ud-iq1_m"))
+        self.assertIsNotNone(m.pack("ud-iq2_xxs"))
+        self.assertIsNotNone(m.pack("ud-q2_k_xl"))
+        self.assertIn("UD-IQ2_XXS.basalt", m.pack("ud-iq2_xxs").url)
         self.assertEqual(colab.missing_vm_files(self.p.vm_dir), [])
 
     def test_config_toml_roundtrip_validation_and_hot_cold_diff(self) -> None:
         cfg = config.Config()
+        cfg.basalt.quant = "ud-iq2_xxs"
         cfg.basalt.max_context = 1048576
         cfg.basalt.parallel = 3
         cfg.basalt.kv = "fp16"
         cfg.basalt.effort = "high"
+        cfg.basalt.uncensor_scale = 1.2
         cfg.basalt.ref = "main"
         cfg.basalt.sampling.temperature = 0.7
         cfg.basalt.sampling.top_p = 0.95
@@ -51,8 +57,10 @@ class ConfigAndUnitTests(unittest.TestCase):
 
         loaded = config.load_config(self.p, apply_env=False)
         self.assertEqual(loaded.to_dict(), cfg.to_dict())
+        self.assertEqual(loaded.basalt.effective_model_alias, "DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS")
         self.assertEqual(loaded.basalt.max_context, 1048576)
         self.assertEqual(loaded.basalt.sampling.to_basalt_dict(), {"temperature": 0.7, "top-p": 0.95})
+        self.assertEqual(loaded.describe_uncensor(), "uncensored ×1.2")
 
         # Hot vs cold diff
         hot_only = loaded.clone()
@@ -64,13 +72,18 @@ class ConfigAndUnitTests(unittest.TestCase):
 
         cold_change = loaded.clone()
         cold_change.basalt.kv = "fp8"
+        cold_change.basalt.uncensor_scale = 1.0
         _, cold2 = config.diff_hot_cold(loaded, cold_change)
-        self.assertEqual(cold2, ["basalt.kv"])
+        self.assertEqual(sorted(cold2), ["basalt.kv", "basalt.uncensor_scale"])
 
-        # Context parser supports up to 1M
+        # Context & quant parsers
         self.assertEqual(
             [config.context_value(v) for v in ("32k", "262K", "512k", "1M", "5000", "4095", "2000000", "abc")],
             [32768, 262144, 524288, 1048576, 5120, None, None, None],
+        )
+        self.assertEqual(
+            [config.quant_value(v) for v in ("iq1_m", "UD-IQ2_XXS", "q2_k_xl", "custom", "nvfp4")],
+            ["ud-iq1_m", "ud-iq2_xxs", "ud-q2_k_xl", "custom", None],
         )
 
         # Validation rejects out-of-range values
@@ -84,19 +97,43 @@ class ConfigAndUnitTests(unittest.TestCase):
         with self.assertRaises(config.ConfigError):
             config.validate_config(bad_kv)
 
+        bad_scale = loaded.clone()
+        bad_scale.basalt.uncensor_scale = 2.5
+        with self.assertRaises(config.ConfigError):
+            config.validate_config(bad_scale)
+
     def test_boot_vars_and_cmd(self) -> None:
+        m = manifest.load_manifest(self.p.vm_dir)
         cfg = config.Config()
+        cfg.basalt.quant = "ud-iq2_xxs"
         cfg.basalt.max_context = 524288
+        cfg.basalt.uncensor_scale = 1.25
         cfg.basalt.ref = "v0.5.8"
         cfg.basalt.sampling.temperature = 0.8
-        bv = cfg.boot_vars()
+        bv = cfg.boot_vars(manifest=m)
+        self.assertEqual(bv["MODEL_QUANT"], "ud-iq2_xxs")
+        self.assertEqual(bv["MODEL_ALIAS"], "DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS")
+        self.assertIn("UD-IQ2_XXS.basalt", bv["MODEL_URL"])
         self.assertEqual(bv["CTX"], "524288")
+        self.assertEqual(bv["RAM_BUDGET"], "0")
+        self.assertEqual(bv["UNCENSOR"], "1")
+        self.assertEqual(bv["UNCENSOR_SCALE"], "1.25")
         self.assertEqual(bv["BASALT_REF"], "v0.5.8")
         self.assertEqual(bv["VISION_MODE"], "dynamic")
         self.assertEqual(bv["BASALT_SAMPLING_JSON"], '{"temperature":0.8}')
         cmd = colab.boot_cmd(bv)
         self.assertIn("setsid nohup bash vm/boot.sh", cmd)
         self.assertNotIn("libpin.so", cmd)
+
+        # Experimental ud-q2_k_xl requires explicit self-hosted pack_url
+        q2 = config.Config()
+        q2.basalt.quant = "ud-q2_k_xl"
+        with self.assertRaises(config.ConfigError):
+            q2.boot_vars(manifest=m)
+        q2.basalt.pack_url = "https://huggingface.co/me/ds41/resolve/main/DeepSeek-V4.1-Flash-1017-UD-Q2_K_XL.basalt"
+        bv2 = q2.boot_vars(manifest=m)
+        self.assertEqual(bv2["MODEL_ALIAS"], "DeepSeek-V4.1-Flash-1017-UD-Q2_K_XL")
+        self.assertEqual(bv2["MODEL_URL"], q2.basalt.pack_url)
 
     def test_legacy_state_migration(self) -> None:
         legacy = self.tmp / "old_state"
@@ -217,6 +254,28 @@ class ConfigAndUnitTests(unittest.TestCase):
                     f.seek(1179648)
                     f.write(b"\xAA" * 262144)
                 self.assertEqual(bj.punch_sections(str(pf), {"dspark/gguf"}), 262144)
+                ok_p, before_b, after_b, rc_p, _ = bj.test_punch_support(str(self.tmp))
+                self.assertTrue(ok_p, f"punch probe failed: before={before_b} after={after_b} rc={rc_p}")
+
+            # 3-mode storage planner across real Colab G4 specs (96 GiB VRAM, 176 GiB RAM, 220 GiB disk)
+            GIB = 1024 ** 3
+            p_iq1 = bj.plan_storage(int(139.1 * GIB), int(110.6 * GIB), ram_total_gib=176.0, disk_free_gib=220.0, vram_gib=96.0)
+            self.assertEqual((p_iq1["stage_mode"], p_iq1["model_path"], p_iq1["engram_path"]),
+                             ("ram+ram", "/mnt/ram/model.basalt", "/mnt/ram/engram.bin"))
+            self.assertEqual(p_iq1["ram_budget"], 57)
+
+            p_iq2 = bj.plan_storage(int(154.8 * GIB), int(110.6 * GIB), ram_total_gib=176.0, disk_free_gib=220.0, vram_gib=96.0)
+            self.assertEqual((p_iq2["stage_mode"], p_iq2["model_path"], p_iq2["engram_path"]),
+                             ("ram+ssd", "/mnt/ram/model.basalt", "/content/engram.bin"))
+            self.assertGreaterEqual(p_iq2["ram_budget"], 80)
+
+            p_q2xl = bj.plan_storage(int(201.0 * GIB), int(110.6 * GIB), ram_total_gib=176.0, disk_free_gib=220.0, vram_gib=96.0)
+            self.assertEqual((p_q2xl["stage_mode"], p_q2xl["model_path"], p_q2xl["engram_path"]),
+                             ("ssd+ssd", "/content/model.basalt", "/content/engram.bin"))
+            self.assertGreaterEqual(p_q2xl["ram_budget"], 120)
+
+            with self.assertRaises(RuntimeError):
+                bj.plan_storage(int(294.2 * GIB), int(104.4 * GIB), ram_total_gib=176.0, disk_free_gib=220.0, vram_gib=96.0)
 
             dim = 4
             def npy(shape, fortran, vals):
@@ -233,10 +292,10 @@ class ConfigAndUnitTests(unittest.TestCase):
                 "blk.0.attn_output_b.weight": {"section": "gguf", "offset": 0, "bytes": 210 * dim, "shape": [256, dim], "type_id": 14},
                 "blk.1.ffn_down_shexp.weight": {"section": "gguf", "offset": 4096, "bytes": 176 * dim, "shape": [256, dim], "type_id": 13},
             }}
-            _, _, _, plan = ab.build_plan_from_meta("/mnt/ram/model.basalt", secs, meta, str(npz))
-            self.assertEqual([(p[1], p[5], p[7]) for p in plan],
-                             [("blk.0.attn_output_b.weight", 131072, 0.5),
-                              ("blk.1.ffn_down_shexp.weight", 131072 + 4096, 0.75)])
+            _, _, _, plan = ab.build_plan_from_meta("/mnt/ram/model.basalt", secs, meta, str(npz), scale_mult=1.2)
+            self.assertEqual([(p[1], p[5], round(p[7], 6)) for p in plan],
+                             [("blk.0.attn_output_b.weight", 131072, 0.6),
+                              ("blk.1.ffn_down_shexp.weight", 131072 + 4096, 0.9)])
         finally:
             sys.path.remove(str(self.p.vm_dir))
 

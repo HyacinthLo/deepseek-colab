@@ -1,18 +1,21 @@
 # How `basalt-colab` Works
 
-`basalt-colab` is engineered from first principles around **Basalt v0.5.7** and **DeepSeek-V4.1-Flash (`UD-IQ1_M`)** on a single Google Colab G4 (RTX PRO 6000 Blackwell 96 GB VRAM, ~176 GiB usable host RAM, slow local SSD).
+`basalt-colab` is engineered from first principles around **Basalt v0.5.7** and **DeepSeek-V4.1-Flash** (`UD-IQ1_M`, `UD-IQ2_XXS`, and experimental self-hosted `UD-Q2_K_XL`) on a single Google Colab G4 (RTX PRO 6000 Blackwell 96 GB VRAM, ~176 GiB usable host RAM, ~220 GiB local SSD).
 
-## 1. Zero-SSD Two-Phase tmpfs Pipeline (`basalt_colab/vm/boot.sh`)
+## 1. Adaptive 3-Mode Storage Pipeline (`basalt_colab/vm/boot.sh`)
 
-Unsloth's 249.6 GiB `DeepSeek-V4.1-Flash-1017-UD-IQ1_M.basalt` (`BASALTMF v2`) exceeds 176 GiB host RAM when stored whole. `basalt_colab/vm/basalt_jobs.py` reads the 64 KiB header via HTTP range request and splits it into:
-1. **Backbone (`/mnt/ram/model.basalt`, 139.1 GiB)**: `meta`, `gguf`, `dspark/gguf`, `vision/mmproj`, `experts`.
-2. **Engram (`/mnt/ram/engram.bin`, 110.6 GiB)**: `engram` IQ4_NL lookup table.
+Before downloading any weights, `basalt_colab/vm/basalt_jobs.py --plan` reads only the 64 KiB `BASALTMF v2` header via HTTP Range request and automatically chooses a zero-SSD-expert staging plan against the VM's real RAM, VRAM, and `/content` free space:
 
-Boot sequence (`139s` source build; `~95s` with GitHub Actions prebuilt `sm_120` tarball):
-1. **Parallel**: 64-worker download of the 139.1 GiB backbone (`~42s`), 43 KB rank-2 `abliteration-edit.npz` fetch (`~1s`), and `vm/build.sh` (fetches prebuilt `basalt` + `abliterate` tarball with SHA-256 verification, or falls back to source compilation / `--basalt-ref`).
-2. **In-place Abliteration (`~1.5–3s`)**: `abliterate_basalt.py` + standalone OpenMP `abliterate.c` applies mrfakename's 43 KB rank-2 edit directly across all 62/62 target `Q8_0`/`Q5_K`/`Q6_K` tensors via stochastic rounding.
-3. **Load & Punch-on-Read (`~17s`)**: `POST /load` moves hot experts to VRAM (~87 GiB) and resident complement to pinned host RAM (55 GiB budget). Patch #3 (`BASALT_PUNCH_FILE`) calls `fallocate(FALLOC_FL_PUNCH_HOLE)` as chunks load, and `basalt_jobs.py --punch-sections dspark/gguf dense` reclaims another 8 GiB — shrinking `/mnt/ram/model.basalt` from 139.1 GiB down to **1.6 GiB**.
-4. **Engram Stream (`~32s`)**: Streams the 110.6 GiB Engram table into `/mnt/ram/engram.bin`, leaving **~10 GiB host RAM free**.
+1. **`ram+ram` (`UD-IQ1_M`, 139.1 GiB backbone + 110.6 GiB Engram)**: Backbone downloads into `/mnt/ram/model.basalt`, shrinks to `~1.6 GiB` via punch-on-read during `POST /load`, then Engram streams into `/mnt/ram/engram.bin`. **100% RAM+VRAM, 0 SSD I/O.**
+2. **`ram+ssd` (`UD-IQ2_XXS`, 154.8 GiB backbone + 110.6 GiB Engram)**: Backbone still downloads into `/mnt/ram/model.basalt` and punches down to `~1.6 GiB` during `POST /load` with an auto-raised `resident-budget-gib` (~87 GiB) so **100% of routed experts stay in VRAM+RAM (0 cold experts on SSD)**. Only `engram.bin` (288 B random read/token) streams to `/content/engram.bin`, backed by ~85 GiB of Linux Page Cache.
+3. **`ssd+ssd` (experimental self-hosted `UD-Q2_K_XL`, ~201 GiB backbone + 110.6 GiB Engram)**: Probes `FALLOC_FL_PUNCH_HOLE` on `/content` first, stages backbone on `/content/model.basalt`, punches ~200 GiB free during `POST /load` (with auto-raised `resident-budget-gib` ~130 GiB), then streams `engram.bin` onto `/content/engram.bin`.
+4. **Fail-fast guard**: Any pack whose backbone exceeds `VRAM + RAM` zero-SSD-expert capacity (e.g. `NVFP4`, ~294 GiB backbone) is rejected in 1 second before spending CU.
+
+Boot sequence (`~139s` source build on `UD-IQ1_M`; `~95s` with GitHub Actions prebuilt `sm_120` tarball):
+1. **Parallel**: 64-worker download of the sparse backbone, 43 KB rank-2 `abliteration-edit.npz` fetch (`~1s`), and `vm/build.sh` (fetches prebuilt `basalt` + `abliterate` tarball with SHA-256 verification, or falls back to source compilation / `--basalt-ref`).
+2. **In-place Abliteration (`~1.5–3s`)**: `abliterate_basalt.py --scale $UNCENSOR_SCALE` + standalone OpenMP `abliterate.c` applies mrfakename's 43 KB rank-2 edit directly across all 62/62 target `Q8_0`/`Q5_K`/`Q6_K` tensors via stochastic rounding (0% decode slowdown).
+3. **Load & Punch-on-Read (`~17s`)**: `POST /load` moves hot experts to VRAM (~87 GiB) and resident complement to pinned host RAM. Patch #3 (`BASALT_PUNCH_FILE`) calls `fallocate(FALLOC_FL_PUNCH_HOLE)` as chunks load, and `basalt_jobs.py --punch-sections dspark/gguf dense` reclaims another 8 GiB — shrinking the backbone file down to **~1.6 GiB**.
+4. **Engram Stream**: Streams the 110.6 GiB Engram table into `/mnt/ram/engram.bin` (`ram+ram`) or `/content/engram.bin` (`ram+ssd` / `ssd+ssd`).
 5. **Warmup & Gate (`~1s`)**: Verifies generation, opens `gate.py` on `:18080`, and arms the VM-side hard-cap backstop (`MAX_HOURS * 3600 + 300s`).
 
 ## 2. Native Basalt v2 Configuration (`basalt_colab/vm/serve.sh`)

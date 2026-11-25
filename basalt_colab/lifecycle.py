@@ -47,19 +47,20 @@ KEEPALIVE_S = 5
 UPSTREAM_TIMEOUT = 3600
 
 STEPS = (
+    ("plan", r"storage plan mode=", "storage layout planned"),
     ("patch", r"abliteration edit fetched", "abliteration edit downloaded (43 KB)"),
-    ("model", r"backbone fetched \(basalt [^)]+\)", "model downloaded (Basalt UD-IQ1_M)"),
+    ("model", r"backbone fetched \([^)]+\)", "model backbone downloaded"),
     ("build", r"basalt built", "Basalt built / ready"),
     ("abliterate", r"abliteration applied", "abliteration baked into weights (62/62)"),
     ("loaded", r"weights loaded", "model loaded onto GPU + RAM"),
-    ("pinned", r"pin: ", "tmpfs RAM punched & reclaimed"),
-    ("engram", r"engram done", "Engram table loaded (110.6 GB)"),
+    ("pinned", r"pin: ", "backbone storage punched & reclaimed"),
+    ("engram", r"engram done", "Engram table loaded"),
     ("warm", r"first token", "warmup answer done"),
 )
 LATER = (
     ("loaded", "loading the model onto GPU + RAM"),
-    ("pinned", "reclaiming tmpfs RAM"),
-    ("engram", "loading the Engram table (110.6 GB)"),
+    ("pinned", "reclaiming backbone storage"),
+    ("engram", "loading the Engram table"),
     ("warm", "warming up"),
 )
 
@@ -178,7 +179,7 @@ def stop_cloud(
                 cu_est=cu,
                 balance_start=s.get("balance_start"),
                 balance_end=bal,
-                model=s.get("model") or cfg.basalt.model_alias,
+                model=s.get("model") or cfg.basalt.effective_model_alias,
                 basalt_ref=s.get("basalt_ref") or cfg.basalt.ref or manifest.basalt_tag,
                 served=served,
             )
@@ -233,6 +234,9 @@ class Manager:
         self._stats_cache: dict[str, Any] | None = None
         self._override_wait_gpu: bool | None = None
         self._override_ref: str | None = None
+        self._override_quant: str | None = None
+        self._override_pack_url: str | None = None
+        self._override_uncensor_scale: float | None = None
 
     def ready(self) -> bool:
         return self.state == "ready" and self.tunnel_ok
@@ -273,6 +277,9 @@ class Manager:
         is_gone: Callable[[], bool] | None = None,
         wait_gpu: bool | None = None,
         basalt_ref: str | None = None,
+        quant: str | None = None,
+        pack_url: str | None = None,
+        uncensor_scale: float | None = None,
     ) -> str | None:
         t0 = time.time()
         tick, mine = t0 + every, None
@@ -298,6 +305,9 @@ class Manager:
                             return "proxy is shutting down"
                         self._override_wait_gpu = wait_gpu
                         self._override_ref = basalt_ref
+                        self._override_quant = quant
+                        self._override_pack_url = pack_url
+                        self._override_uncensor_scale = uncensor_scale
                         self._begin(True, explicit=explicit)
                     if self.state == "starting":
                         mine = self.attempt
@@ -794,7 +804,9 @@ class Manager:
                 "stage": self.activity() if self.state == "starting" else "",
                 "steps": steps_view,
                 "session": self.cfg.colab.session,
-                "model": self.cfg.basalt.model_alias,
+                "model": self.cfg.basalt.effective_model_alias,
+                "quant": self.cfg.basalt.quant,
+                "uncensor": self.cfg.describe_uncensor(),
                 "basalt_ref": self.cfg.basalt.ref or self.manifest.basalt_tag,
                 "engine_summary": self.cfg.describe_engine(),
                 "active": self.active,

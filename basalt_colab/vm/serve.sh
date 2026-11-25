@@ -50,8 +50,9 @@ if sampling_raw:
 
 engine = {
     "vram-reserve-mib": int(os.environ["VRAM_RESERVE"]),
-    "resident-budget-gib": int(os.environ["RAM_BUDGET"]),
 }
+if int(os.environ["RAM_BUDGET"]) > 0:
+    engine["resident-budget-gib"] = int(os.environ["RAM_BUDGET"])
 if int(os.environ["CONV_CACHE_MIB"]) > 0:
     engine["conversation-cache-disk-mib"] = int(os.environ["CONV_CACHE_MIB"])
     engine["conversation-cache-dir"] = os.environ["CONV_CACHE_DIR"]

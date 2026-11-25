@@ -6,6 +6,35 @@
   "prebuilt_sha256": "",
   "pack_url": "https://huggingface.co/jesdga/DeepSeek-V4.1-Flash-1017-Basalt/resolve/main/DeepSeek-V4.1-Flash-1017-UD-IQ1_M.basalt",
   "pack_model_id": "DeepSeek-V4.1-Flash-1017-UD-IQ1_M",
+  "packs": {
+    "ud-iq1_m": {
+      "url": "https://huggingface.co/jesdga/DeepSeek-V4.1-Flash-1017-Basalt/resolve/main/DeepSeek-V4.1-Flash-1017-UD-IQ1_M.basalt",
+      "model_alias": "DeepSeek-V4.1-Flash-1017-UD-IQ1_M",
+      "size_gb": 260,
+      "kld": 0.2779,
+      "top1": 83.88,
+      "estimated_speed_tok_s": 160.4,
+      "description": "1-bit Dynamic V3.1 · 100% VRAM+RAM resident (fastest, 0 SSD bottleneck)"
+    },
+    "ud-iq2_xxs": {
+      "url": "https://huggingface.co/jesdga/DeepSeek-V4.1-Flash-1017-Basalt/resolve/main/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS.basalt",
+      "model_alias": "DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS",
+      "size_gb": 285,
+      "kld": 0.2408,
+      "top1": 85.15,
+      "estimated_speed_tok_s": 130.0,
+      "description": "2-bit Dynamic V3.1 · -13.4% KLD vs IQ1_M; Engram on SSD, 0 cold experts on SSD"
+    },
+    "ud-q2_k_xl": {
+      "url": "",
+      "model_alias": "DeepSeek-V4.1-Flash-1017-UD-Q2_K_XL",
+      "size_gb": 335,
+      "kld": null,
+      "top1": null,
+      "estimated_speed_tok_s": 105.0,
+      "description": "2-bit XL (experimental) · requires self-hosted pack_url built with scripts/build_q2k_xl_pack.py"
+    }
+  },
   "abliteration_url": "https://huggingface.co/mrfakename/DeepSeek-V4.1-Flash-1017-abliterated/resolve/4433164758a8045b1b915b7644cce97b9a0e274c/abliteration-edit.npz",
   "abliteration_sha256": "83273cdbe06e65ad2852dd09e8d976a0e8ce3209788938add325989c20b63b02",
   "colab_cli": "google-colab-cli==0.7.5",

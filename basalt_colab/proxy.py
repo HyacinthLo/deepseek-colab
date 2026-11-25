@@ -43,12 +43,12 @@ HOP = {
 
 def write_opencode_config(paths: Paths, cfg: Config, port: int | None = None) -> None:
     p = port or cfg.proxy.port
-    model_id = cfg.basalt.model_alias
+    model_id = cfg.basalt.effective_model_alias
     image = {"attachment": True, "modalities": {"input": ["text", "image"], "output": ["text"]}} if cfg.basalt.vision != "off" else {}
     models = {
         model_id: dict(
             {
-                "name": f"DeepSeek-V4.1-Flash UD-IQ1_M (Basalt, effort {cfg.basalt.effort})",
+                "name": f"DeepSeek-V4.1-Flash {cfg.basalt.quant.upper()} (Basalt, effort {cfg.basalt.effort})",
                 "tool_call": True,
                 "reasoning": True,
                 "interleaved": {"field": "reasoning_content"},
@@ -81,7 +81,7 @@ def write_opencode_config(paths: Paths, cfg: Config, port: int | None = None) ->
 
 
 def rewrite_request(body: bytes, cfg: Config, path: str = "/v1/chat/completions") -> bytes:
-    """Single-model routing to cfg.basalt.model_alias (unless strict_model) + saved default effort injection."""
+    """Single-model routing to cfg.basalt.effective_model_alias (unless strict_model) + saved default effort injection."""
     try:
         req = json.loads(body)
     except ValueError:
@@ -89,8 +89,9 @@ def rewrite_request(body: bytes, cfg: Config, path: str = "/v1/chat/completions"
     if not isinstance(req, dict):
         return body
     changed = False
-    if not cfg.proxy.strict_model and req.get("model") != cfg.basalt.model_alias:
-        req["model"] = cfg.basalt.model_alias
+    target_model = cfg.basalt.effective_model_alias
+    if not cfg.proxy.strict_model and req.get("model") != target_model:
+        req["model"] = target_model
         changed = True
     effort = str(cfg.basalt.effort)
     if effort != "50":
@@ -289,10 +290,11 @@ class Handler(BaseHTTPRequestHandler):
     def models_payload(self) -> dict[str, Any]:
         cfg = self.server.mgr.cfg
         entry = {
-            "id": cfg.basalt.model_alias,
+            "id": cfg.basalt.effective_model_alias,
             "object": "model",
             "owned_by": "basalt",
             "created": 0,
+            "quant": cfg.basalt.quant,
             "reasoning_effort": str(cfg.basalt.effort),
             "context_length": cfg.basalt.max_context,
             "image_input": cfg.basalt.vision != "off",
@@ -609,6 +611,9 @@ class Handler(BaseHTTPRequestHandler):
                     explicit=True,
                     wait_gpu=opts.get("wait_gpu"),
                     basalt_ref=opts.get("basalt_ref"),
+                    quant=opts.get("quant"),
+                    pack_url=opts.get("pack_url"),
+                    uncensor_scale=opts.get("uncensor_scale"),
                 )
                 if not err:
                     mgr.leave(served=0)
@@ -662,8 +667,8 @@ def serve(paths: Paths, cfg: Config, manifest: Manifest, detached: bool = False)
     threading.Thread(target=srv.mgr.monitor, daemon=True).start()
     logger.log(
         f"serve: http://{cfg.proxy.host}:{cfg.proxy.port}/v1 (console /_console), "
-        f"{cfg.basalt.model_alias} ({cfg.describe_engine()}), session {cfg.colab.session} "
-        f"(idle {cfg.colab.idle_min:.1f} min, cap {cfg.colab.max_hours:.1f} h)"
+        f"{cfg.basalt.effective_model_alias} ({cfg.describe_engine()}, {cfg.describe_uncensor()}), "
+        f"session {cfg.colab.session} (idle {cfg.colab.idle_min:.1f} min, cap {cfg.colab.max_hours:.1f} h)"
     )
     try:
         srv.serve_forever(0.5)

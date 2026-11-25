@@ -69,9 +69,12 @@ def parse_basalt_header(hdr_bytes):
     return file_bytes, secs
 
 
-def build_plan_from_meta(pack_path, secs, meta, npz_path):
+def build_plan_from_meta(pack_path, secs, meta, npz_path, scale_mult=1.0):
     dim, q0, q1, scales = load_edit_npz(npz_path)
-    expected = sum(1 for a, b in scales for x in (a, b) if abs(x) > 0.0)
+    mult = float(scale_mult)
+    assert 0.0 <= mult <= 2.0, f'abliteration scale multiplier out of range [0.0, 2.0]: {mult}'
+    scaled = [(a * mult, b * mult) for a, b in scales]
+    expected = sum(1 for a, b in scaled for x in (a, b) if abs(x) > 0.0)
     real = os.path.realpath(pack_path)
     plan = []
     for name, info in sorted(meta['tensors'].items()):
@@ -79,9 +82,9 @@ def build_plan_from_meta(pack_path, secs, meta, npz_path):
         if not m:
             continue
         layer, kind = int(m.group(1)), m.group(2)
-        if layer >= len(scales):
+        if layer >= len(scaled):
             continue
-        scale = scales[layer][0 if kind == 'attn_output_b' else 1]
+        scale = scaled[layer][0 if kind == 'attn_output_b' else 1]
         if scale == 0.0:
             continue
         sec_name = info.get('section', 'gguf')
@@ -119,9 +122,14 @@ def main():
     ap.add_argument('pack')
     ap.add_argument('npz')
     ap.add_argument('abliterate_bin', nargs='?', default=None)
+    ap.add_argument('--scale', type=float, default=1.0, help='Multiplier on per-layer refusal removal strength (default 1.0)')
     ap.add_argument('--dry-run', action='store_true')
     ap.add_argument('--update-sha', action='store_true')
     args = ap.parse_args()
+
+    if args.scale == 0.0:
+        print(f'abliteration skipped (--scale 0.0)')
+        return
 
     with open(args.pack, 'rb') as f:
         hdr = f.read(HEADER_BYTES)
@@ -130,10 +138,10 @@ def main():
         f.seek(moff)
         meta = json.loads(f.read(mbytes))
 
-    dim, q0, q1, plan = build_plan_from_meta(args.pack, secs, meta, args.npz)
+    dim, q0, q1, plan = build_plan_from_meta(args.pack, secs, meta, args.npz, scale_mult=args.scale)
     if args.dry_run:
         total_mb = sum(x[6] for x in plan) / (1024 * 1024)
-        print(f'DRY-RUN OK: dim={dim} targets={len(plan)} total={total_mb:.1f} MiB')
+        print(f'DRY-RUN OK: dim={dim} targets={len(plan)} scale={args.scale:g} total={total_mb:.1f} MiB')
         return
 
     assert args.abliterate_bin and os.path.exists(args.abliterate_bin), f'missing abliterate binary: {args.abliterate_bin}'
@@ -153,7 +161,7 @@ def main():
 
     if args.update_sha:
         refresh_section_sha256(args.pack, secs, 'gguf')
-    print(f'abliteration applied to {args.pack} ({len(plan)} tensors)')
+    print(f'abliteration applied to {args.pack} ({len(plan)} tensors, scale={args.scale:g})')
 
 
 if __name__ == '__main__':

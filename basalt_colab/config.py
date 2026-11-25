@@ -10,6 +10,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+from basalt_colab.manifest import Manifest
 from basalt_colab.paths import Paths
 
 CONTEXT_ALIASES = {
@@ -26,7 +27,29 @@ CONTEXT_ALIASES = {
     "1048k": 1048576,
 }
 
-DEFAULT_MODEL_ALIAS = "DeepSeek-V4.1-Flash-1017-UD-IQ1_M"
+QUANT_ALIASES = {
+    "iq1_m": "ud-iq1_m",
+    "ud-iq1_m": "ud-iq1_m",
+    "ud_iq1_m": "ud-iq1_m",
+    "iq2_xxs": "ud-iq2_xxs",
+    "ud-iq2_xxs": "ud-iq2_xxs",
+    "ud_iq2_xxs": "ud-iq2_xxs",
+    "q2_k_xl": "ud-q2_k_xl",
+    "ud-q2_k_xl": "ud-q2_k_xl",
+    "ud_q2_k_xl": "ud-q2_k_xl",
+    "custom": "custom",
+}
+
+QUANT_DEFAULT_MODEL_ALIAS = {
+    "ud-iq1_m": "DeepSeek-V4.1-Flash-1017-UD-IQ1_M",
+    "ud-iq2_xxs": "DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS",
+    "ud-q2_k_xl": "DeepSeek-V4.1-Flash-1017-UD-Q2_K_XL",
+    "custom": "DeepSeek-V4.1-Flash-1017-Custom",
+}
+
+DEFAULT_QUANT = "ud-iq1_m"
+DEFAULT_MODEL_ALIAS = QUANT_DEFAULT_MODEL_ALIAS[DEFAULT_QUANT]
+VALID_QUANTS = ("ud-iq1_m", "ud-iq2_xxs", "ud-q2_k_xl", "custom")
 VALID_DRAFT_EXPERTS = (0, 32, 64, 96, 128)
 HOT_FIELDS = frozenset({
     "colab.idle_min",
@@ -40,6 +63,11 @@ HOT_FIELDS = frozenset({
 
 class ConfigError(ValueError):
     """Raised when configuration values fail schema or range validation."""
+
+
+def quant_value(text: str) -> str | None:
+    """Normalizes quantization preset names (ud-iq1_m, ud-iq2_xxs, ud-q2_k_xl, custom)."""
+    return QUANT_ALIASES.get(str(text).strip().lower())
 
 
 def context_value(text: str | int) -> int | None:
@@ -131,8 +159,10 @@ class SamplingConfig:
 
 @dataclass(slots=True)
 class BasaltConfig:
+    quant: str = DEFAULT_QUANT
+    pack_url: str = ""
     ref: str = ""
-    model_alias: str = DEFAULT_MODEL_ALIAS
+    model_alias: str = ""
     max_context: int = 262144
     parallel: int = 2
     kv: str = "fp8"
@@ -141,11 +171,30 @@ class BasaltConfig:
     draft_experts: int = 32
     conv_cache_mib: int = 32768
     vram_reserve_mib: int = 700
-    resident_budget_gib: int = 55
+    resident_budget_gib: int = 0
     uncensor: bool = True
+    uncensor_scale: float = 1.0
     effort: str = "50"
     workers: int = 64
     sampling: SamplingConfig = field(default_factory=SamplingConfig)
+
+    @property
+    def effective_model_alias(self) -> str:
+        raw = self.model_alias.strip()
+        if raw and raw.lower() != "auto":
+            return raw
+        return QUANT_DEFAULT_MODEL_ALIAS.get(self.quant, DEFAULT_MODEL_ALIAS)
+
+    def resolved_pack_url(self, manifest: Manifest | None = None) -> str:
+        if self.pack_url.strip():
+            return self.pack_url.strip()
+        if manifest is not None:
+            spec = manifest.pack(self.quant)
+            if spec and spec.url:
+                return spec.url
+            if self.quant == DEFAULT_QUANT and manifest.pack_url:
+                return manifest.pack_url
+        return ""
 
 
 @dataclass(slots=True)
@@ -163,26 +212,35 @@ class Config:
     def describe_engine(self) -> str:
         ref = f"ref={self.basalt.ref} · " if self.basalt.ref else ""
         return (
-            f"{ref}{short_context(self.basalt.max_context)}×{self.basalt.parallel} "
+            f"{ref}{self.basalt.quant.upper()} · {short_context(self.basalt.max_context)}×{self.basalt.parallel} "
             f"{self.basalt.kv.upper()} KV · vision {self.basalt.vision}"
         )
 
+    def describe_uncensor(self) -> str:
+        if not self.basalt.uncensor or self.basalt.uncensor_scale <= 0:
+            return "original"
+        if abs(self.basalt.uncensor_scale - 1.0) < 1e-6:
+            return "uncensored"
+        return f"uncensored ×{self.basalt.uncensor_scale:g}"
+
     def summary(self) -> str:
         return " · ".join((
-            self.basalt.model_alias,
+            self.basalt.effective_model_alias,
             self.describe_engine(),
             f"effort {self.basalt.effort}",
             f"idle {self.colab.idle_min:g} min",
             f"cap {self.colab.max_hours:g} h",
-            "uncensored" if self.basalt.uncensor else "original",
+            self.describe_uncensor(),
         ))
 
     def cold_signature(self) -> dict[str, Any]:
         """Fields that require a VM restart if changed while G4 is running."""
         b = self.basalt
         return {
+            "quant": b.quant,
+            "pack_url": b.pack_url,
             "ref": b.ref,
-            "model_alias": b.model_alias,
+            "model_alias": b.effective_model_alias,
             "max_context": b.max_context,
             "parallel": b.parallel,
             "kv": b.kv,
@@ -193,14 +251,23 @@ class Config:
             "vram_reserve_mib": b.vram_reserve_mib,
             "resident_budget_gib": b.resident_budget_gib,
             "uncensor": b.uncensor,
+            "uncensor_scale": b.uncensor_scale,
             "sampling": b.sampling.to_basalt_dict(),
         }
 
-    def boot_vars(self, extra_env: dict[str, str] | None = None) -> dict[str, str]:
+    def boot_vars(self, extra_env: dict[str, str] | None = None, manifest: Manifest | None = None) -> dict[str, str]:
         """Builds shell-safe environment variables passed to vm/boot.sh."""
         b = self.basalt
+        pack_url = b.resolved_pack_url(manifest)
+        if b.quant in ("ud-q2_k_xl", "custom") and not pack_url:
+            raise ConfigError(
+                f"basalt.quant={b.quant!r} requires basalt.pack_url pointing to your .basalt pack "
+                f"(build UD-Q2_K_XL with scripts/build_q2k_xl_pack.py)"
+            )
+        uncensor_active = b.uncensor and b.uncensor_scale > 0.0
         env: dict[str, str] = {
-            "MODEL_ALIAS": b.model_alias,
+            "MODEL_QUANT": b.quant,
+            "MODEL_ALIAS": b.effective_model_alias,
             "CTX": str(b.max_context),
             "PARALLEL": str(b.parallel),
             "KV_TYPE": b.kv,
@@ -210,10 +277,13 @@ class Config:
             "CONV_CACHE_MIB": str(b.conv_cache_mib),
             "VRAM_RESERVE": str(b.vram_reserve_mib),
             "RAM_BUDGET": str(b.resident_budget_gib),
-            "UNCENSOR": "1" if b.uncensor else "0",
+            "UNCENSOR": "1" if uncensor_active else "0",
+            "UNCENSOR_SCALE": f"{b.uncensor_scale:g}",
             "WORKERS": str(b.workers),
             "MAX_HOURS": str(self.colab.max_hours),
         }
+        if pack_url:
+            env["MODEL_URL"] = pack_url
         if b.ref:
             env["BASALT_REF"] = b.ref
         sampling_dict = b.sampling.to_basalt_dict()
@@ -265,11 +335,17 @@ class Config:
             min_p=None if s_raw.get("min_p") in (None, "") else float(s_raw["min_p"]),
             presence_penalty=None if s_raw.get("presence_penalty") in (None, "") else float(s_raw["presence_penalty"]),
         )
+        q_in = b_raw.get("quant", BasaltConfig.quant)
+        q_parsed = quant_value(q_in)
+        if q_parsed is None:
+            raise ConfigError(f"basalt.quant must be one of {VALID_QUANTS}, got {q_in!r}")
         ctx_in = b_raw.get("max_context", BasaltConfig.max_context)
         ctx_parsed = context_value(ctx_in)
         if ctx_parsed is None:
             raise ConfigError(f"basalt.max_context must be 4096..1048576 (or 32K..1M), got {ctx_in!r}")
         basalt = BasaltConfig(
+            quant=q_parsed,
+            pack_url=str(b_raw.get("pack_url", BasaltConfig.pack_url)).strip(),
             ref=str(b_raw.get("ref", BasaltConfig.ref)).strip(),
             model_alias=str(b_raw.get("model_alias", BasaltConfig.model_alias)).strip(),
             max_context=ctx_parsed,
@@ -282,6 +358,7 @@ class Config:
             vram_reserve_mib=int(b_raw.get("vram_reserve_mib", BasaltConfig.vram_reserve_mib)),
             resident_budget_gib=int(b_raw.get("resident_budget_gib", BasaltConfig.resident_budget_gib)),
             uncensor=_parse_bool(b_raw.get("uncensor", BasaltConfig.uncensor)),
+            uncensor_scale=float(b_raw.get("uncensor_scale", BasaltConfig.uncensor_scale)),
             effort=str(b_raw.get("effort", BasaltConfig.effort)).strip().lower(),
             workers=int(b_raw.get("workers", BasaltConfig.workers)),
             sampling=sampling,
@@ -307,7 +384,12 @@ def validate_config(cfg: Config) -> None:
         raise ConfigError("proxy.port must be 1..65535")
 
     b = cfg.basalt
-    if not b.model_alias or "'" in b.model_alias:
+    if b.quant not in VALID_QUANTS:
+        raise ConfigError(f"basalt.quant must be one of {VALID_QUANTS}, got {b.quant!r}")
+    if b.pack_url:
+        if "'" in b.pack_url or not re.match(r"^https?://", b.pack_url):
+            raise ConfigError(f"basalt.pack_url must be an http(s) URL without single quotes: {b.pack_url!r}")
+    if b.model_alias and "'" in b.model_alias:
         raise ConfigError(f"invalid basalt.model_alias: {b.model_alias!r}")
     if b.ref and not re.match(r"^[A-Za-z0-9._/@-]+$", b.ref):
         raise ConfigError(f"invalid basalt.ref: {b.ref!r}")
@@ -327,8 +409,10 @@ def validate_config(cfg: Config) -> None:
         raise ConfigError("basalt.conv_cache_mib must be 0..131072")
     if not (256 <= b.vram_reserve_mib <= 16384):
         raise ConfigError("basalt.vram_reserve_mib must be 256..16384")
-    if not (16 <= b.resident_budget_gib <= 160):
-        raise ConfigError("basalt.resident_budget_gib must be 16..160")
+    if b.resident_budget_gib != 0 and not (16 <= b.resident_budget_gib <= 160):
+        raise ConfigError("basalt.resident_budget_gib must be 0 (auto) or 16..160")
+    if not (0.0 <= b.uncensor_scale <= 2.0):
+        raise ConfigError("basalt.uncensor_scale must be between 0.0 and 2.0")
     if effort_value(b.effort) is None:
         raise ConfigError(f"basalt.effort must be 1-100, low, high, or max; got {b.effort!r}")
     if not (4 <= b.workers <= 128):
@@ -357,6 +441,13 @@ def apply_env_overrides(cfg: Config) -> Config:
         c.proxy.port = int(env["BASALT_COLAB_PORT"])
     if env.get("BASALT_COLAB_STRICT_MODEL"):
         c.proxy.strict_model = _parse_bool(env["BASALT_COLAB_STRICT_MODEL"])
+    if env.get("BASALT_COLAB_QUANT"):
+        q = quant_value(env["BASALT_COLAB_QUANT"])
+        if q is None:
+            raise ConfigError(f"invalid BASALT_COLAB_QUANT: {env['BASALT_COLAB_QUANT']!r}")
+        c.basalt.quant = q
+    if env.get("BASALT_COLAB_PACK_URL"):
+        c.basalt.pack_url = env["BASALT_COLAB_PACK_URL"].strip()
     if env.get("BASALT_COLAB_REF"):
         c.basalt.ref = env["BASALT_COLAB_REF"].strip()
     if env.get("BASALT_COLAB_MODEL_ALIAS"):
@@ -374,6 +465,8 @@ def apply_env_overrides(cfg: Config) -> Config:
         c.basalt.vision = env["BASALT_COLAB_VISION"].strip().lower()
     if env.get("BASALT_COLAB_UNCENSOR"):
         c.basalt.uncensor = _parse_bool(env["BASALT_COLAB_UNCENSOR"])
+    if env.get("BASALT_COLAB_UNCENSOR_SCALE"):
+        c.basalt.uncensor_scale = float(env["BASALT_COLAB_UNCENSOR_SCALE"])
     if env.get("BASALT_COLAB_EFFORT"):
         c.basalt.effort = env["BASALT_COLAB_EFFORT"].strip().lower()
     validate_config(c)
@@ -418,6 +511,8 @@ def dump_toml(cfg: Config) -> str:
         f"strict_model = {_toml_val(p.strict_model)}",
         "",
         "[basalt]",
+        f"quant = {_toml_val(b.quant)}",
+        f"pack_url = {_toml_val(b.pack_url)}",
         f"ref = {_toml_val(b.ref)}",
         f"model_alias = {_toml_val(b.model_alias)}",
         f"max_context = {_toml_val(b.max_context)}",
@@ -430,6 +525,7 @@ def dump_toml(cfg: Config) -> str:
         f"vram_reserve_mib = {_toml_val(b.vram_reserve_mib)}",
         f"resident_budget_gib = {_toml_val(b.resident_budget_gib)}",
         f"uncensor = {_toml_val(b.uncensor)}",
+        f"uncensor_scale = {_toml_val(b.uncensor_scale)}",
         f"effort = {_toml_val(b.effort)}",
         f"workers = {_toml_val(b.workers)}",
         "",

@@ -87,7 +87,7 @@ Starting a Colab G4 GPU · ~2-3 minutes (faster with prebuilt binary)
 
 | Command | Description |
 | --- | --- |
-| `basalt-colab up [--wait-gpu] [--basalt-ref REF]` | Start G4 (`--wait-gpu` retries up to 30 min with backoff; `--basalt-ref` builds an upstream Basalt tag/branch/SHA from source) |
+| `basalt-colab up [--quant Q] [--pack-url URL] [--uncensor-scale S] [--wait-gpu] [--basalt-ref REF]` | Start G4 (`--quant ud-iq1_m\|ud-iq2_xxs\|ud-q2_k_xl\|custom`; `--uncensor-scale` adjusts mrfakename strength; `--wait-gpu` retries up to 30 min; `--basalt-ref` builds an upstream Basalt tag/branch/SHA) |
 | `basalt-colab down [--all]` | Stop G4, wipe VM secrets, record session in `usage.jsonl`, stop detached proxy |
 | `basalt-colab console [--no-open]` | Ensure local proxy is up (without waking G4) and open `/_console` |
 | `basalt-colab status` | Snapshot of Console/Web UI URLs, live Basalt telemetry, CU billing ledger, and Colab balance |
@@ -101,6 +101,17 @@ Starting a Colab G4 GPU · ~2-3 minutes (faster with prebuilt binary)
 | `basalt-colab logs` | Local proxy log + VM boot timeline + Basalt server & engine logs |
 | `basalt-colab doctor` | One-command check of Python 3.11+, OpenSSH, Colab CLI, OAuth balance, `config.toml`, VM payload & local port |
 | `basalt-colab setup` | First-run setup + automatic one-time migration of legacy `./state/{api_key,id_ed25519}` |
+
+## Quantization Tiers & Zero-SSD-Expert Staging
+
+`basalt-colab` inspects the remote 64 KiB `.basalt` header before downloading and automatically plans storage so **0 routed experts spill to SSD**:
+
+| Quant (`[basalt].quant`) | Pack Size | Storage Mode on G4 | Quality (vs BF16) | Notes |
+| --- | --- | --- | --- | --- |
+| **`ud-iq1_m`** *(default)* | 260 GB | **`ram+ram`** (100% RAM+VRAM) | KLD `0.2779` · Top-1 `83.88%` | Fastest (`150–190+ tok/s`), zero SSD I/O |
+| **`ud-iq2_xxs`** | 285 GB | **`ram+ssd`** (Experts 100% RAM+VRAM; Engram on `/content` SSD + ~85 GiB RAM Page Cache) | KLD `0.2408` (**-13.4%**) · Top-1 `85.15%` | Official pack on `jesdga`, higher fidelity |
+| **`ud-q2_k_xl`** *(experimental)* | ~335 GB | **`ssd+ssd`** (Requires `/content` punch-hole + self-hosted `pack_url`) | Highest 2-bit tier | Build & upload with [`scripts/build_q2k_xl_pack.py`](scripts/build_q2k_xl_pack.py) |
+| `NVFP4` *(unsupported)* | 428 GB | **Rejected fail-fast** | — | Backbone (`~294 GiB`) > G4 VRAM+RAM (`~272 GiB`); Basalt requires ≥320 GB RAM |
 
 ## Declarative Configuration (`config.toml`)
 
@@ -118,11 +129,13 @@ orphan_boot_s = 30
 [proxy]
 bind = "127.0.0.1"
 port = 18080
-strict_model = false     # hot-reloadable live (false = route claude-haiku-* / gpt-* -> model_alias)
+strict_model = false     # hot-reloadable live (false = route claude-haiku-* / gpt-* -> active model)
 
 [basalt]
+quant = "ud-iq1_m"       # "ud-iq1_m", "ud-iq2_xxs", "ud-q2_k_xl", or "custom"
+pack_url = ""            # optional URL override (required for ud-q2_k_xl / custom)
 ref = ""                 # empty = pinned manifest (v0.5.7 + prebuilt fast path)
-model_alias = "DeepSeek-V4.1-Flash-1017-UD-IQ1_M"
+model_alias = ""         # empty = auto from quant (e.g. DeepSeek-V4.1-Flash-1017-UD-IQ1_M)
 max_context = 262144     # per-slot up to 1048576 (1M) via native slot-full-context
 parallel = 2             # 1..4 concurrent slots
 kv = "fp8"               # "fp8" or "fp16"
@@ -130,7 +143,9 @@ vision = "dynamic"       # 0 MiB idle VRAM/RAM
 spec = 6                 # DSpark speculative window (0..8)
 draft_experts = 32       # 32, 64, 96, 128, or 0
 conv_cache_mib = 32768   # 32 GiB disk conversation cache
-uncensor = true          # 43 KB rank-2 stochastic-rounding abliteration (62/62 tensors in 1.5s)
+resident_budget_gib = 0  # 0 = auto-planned per storage mode (55 / ~87 / ~130 GiB)
+uncensor = true          # 43 KB mrfakename rank-2 stochastic-rounding abliteration (0% decode slowdown)
+uncensor_scale = 1.0     # strength multiplier (0.0=off, 1.0=default KL 0.067, 1.15-1.25=stronger)
 effort = "50"            # hot-reloadable live (1-100, low, high, max)
 
 [basalt.sampling]
@@ -140,8 +155,8 @@ effort = "50"            # hot-reloadable live (1-100, low, high, max)
 
 ## Architecture & 6-Layer Cost Safety
 
-See [docs/how-it-works.md](docs/how-it-works.md) and [SETUP.md](SETUP.md) for deep dives into split Engram + punch-on-read, in-place rank-2 abliteration, the GitHub Actions prebuilt `sm_120` release pipeline (`.github/workflows/build-basalt-prebuilt.yml`), and the 6-layer cost protection system.
+See [docs/how-it-works.md](docs/how-it-works.md) and [SETUP.md](SETUP.md) for deep dives into 3-mode automatic storage staging, in-place rank-2 abliteration, the offline `UD-Q2_K_XL` pack converter (`scripts/build_q2k_xl_pack.py`), the GitHub Actions prebuilt `sm_120` release pipeline (`.github/workflows/build-basalt-prebuilt.yml`), and the 6-layer cost protection system.
 
 ## Credits
 
-Built on [Basalt](https://github.com/jesdga95/basalt) by jesdga95, DeepSeek-V4.1-Flash by DeepSeek, Unsloth's `UD-IQ1_M.basalt` pack, mrfakename's 43 KB rank-2 `abliteration-edit.npz`, Google's Colab CLI, and inspired by [leonxger/deepseek-colab](https://github.com/leonxger/deepseek-colab).
+Built on [Basalt](https://github.com/jesdga95/basalt) by jesdga95, DeepSeek-V4.1-Flash by DeepSeek, Unsloth's Dynamic V3.1 quantizations (`UD-IQ1_M` / `UD-IQ2_XXS` / `UD-Q2_K_XL`), mrfakename's 43 KB rank-2 `abliteration-edit.npz`, Google's Colab CLI, and inspired by [leonxger/deepseek-colab](https://github.com/leonxger/deepseek-colab).

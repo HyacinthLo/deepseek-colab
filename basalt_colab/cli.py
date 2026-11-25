@@ -50,8 +50,10 @@ from basalt_colab.config import (
     dump_toml,
     effort_value,
     load_config,
+    quant_value,
     save_config,
     short_context,
+    validate_config,
 )
 from basalt_colab.lifecycle import UPSTREAM_TIMEOUT, mmss, run_watchdog, stop_cloud
 from basalt_colab.manifest import Manifest, load_manifest
@@ -59,10 +61,15 @@ from basalt_colab.paths import IS_WIN, Paths, get_paths, migrate_legacy_state
 from basalt_colab.proxy import serve, write_opencode_config
 from basalt_colab.usage import UsageLedger
 
-USAGE = f"""basalt-colab {__version__} — DeepSeek-V4.1-Flash (UD-IQ1_M) on Google Colab G4 via Basalt v0.5.7
+USAGE = f"""basalt-colab {__version__} — DeepSeek-V4.1-Flash on Google Colab G4 via Basalt v0.5.7
 
 usage: basalt-colab COMMAND [options]
-  up [--wait-gpu] [--basalt-ref REF]   set up if needed, start G4 (~2-3 min), print endpoints & live status
+  up [opts]                            start G4 (~2-3 min), print endpoints & live status
+     --quant Q                         ud-iq1_m (default, 100% RAM) | ud-iq2_xxs (-13% KLD) | ud-q2_k_xl | custom
+     --pack-url URL                    override .basalt URL (required for ud-q2_k_xl / custom)
+     --uncensor-scale S                refusal-removal strength multiplier (0.0=off, 1.0=default, 1.15-1.25=stronger)
+     --wait-gpu                        retry G4 allocation up to 30 min with backoff
+     --basalt-ref REF                  build an upstream Basalt tag/branch/SHA from source
   down [--all]                         stop G4, wipe VM secrets, record CU ledger, stop detached proxy
   status                               Control Console & Web UI URLs, Basalt telemetry, billing ledger, Colab balance
   watch                                live terminal status bar (tok/s, VRAM hit %, idle countdown, CU cost)
@@ -78,11 +85,10 @@ usage: basalt-colab COMMAND [options]
   setup                                install Colab CLI, complete Google OAuth, create keys & migrate legacy state/
   serve [--detached]                   run the local proxy in the foreground (Ctrl+C stops the GPU too)
 
-env: BASALT_COLAB_HOME (override config+state dir), BASALT_COLAB_PORT, BASALT_COLAB_BIND,
-     BASALT_COLAB_IDLE_MIN, BASALT_COLAB_MAX_HOURS, BASALT_COLAB_WAIT_GPU, BASALT_COLAB_REF,
-     BASALT_COLAB_MAX_CONTEXT (4096-1048576 / 32K..1M), BASALT_COLAB_PARALLEL (1-4),
-     BASALT_COLAB_KV (fp8|fp16), BASALT_COLAB_EFFORT, BASALT_COLAB_STRICT_MODEL,
-     HF_TOKEN, BASALT_PREBUILT_URL, BASALT_PREBUILT_SHA256, BASALT_COLAB_YES=1"""
+env: BASALT_COLAB_HOME, BASALT_COLAB_PORT, BASALT_COLAB_BIND, BASALT_COLAB_QUANT, BASALT_COLAB_PACK_URL,
+     BASALT_COLAB_UNCENSOR, BASALT_COLAB_UNCENSOR_SCALE, BASALT_COLAB_IDLE_MIN, BASALT_COLAB_MAX_HOURS,
+     BASALT_COLAB_WAIT_GPU, BASALT_COLAB_REF, BASALT_COLAB_MAX_CONTEXT (32K..1M), BASALT_COLAB_PARALLEL (1-4),
+     BASALT_COLAB_KV (fp8|fp16), BASALT_COLAB_EFFORT, BASALT_COLAB_STRICT_MODEL, HF_TOKEN, BASALT_COLAB_YES=1"""
 
 TTY, COLOR = [False], [False]
 
@@ -322,8 +328,8 @@ def endpoint_info(paths: Paths, cfg: Config, manifest: Manifest, port: int, bal:
         ("Web UI", f"http://{host}:{port}/"),
         ("Base URL", f"http://{host}:{port}/v1"),
         ("API key", read_api_key(paths)),
-        ("Model", f"{cfg.basalt.model_alias} (effort {cfg.basalt.effort})"),
-        ("Engine", f"{cfg.describe_engine()} · ~{manifest.estimated_speed_tok_s:.1f} tok/s"),
+        ("Model", f"{cfg.basalt.effective_model_alias} (effort {cfg.basalt.effort}, {cfg.describe_uncensor()})"),
+        ("Engine", f"{cfg.describe_engine()} · ~{(manifest.pack(cfg.basalt.quant).estimated_speed_tok_s if manifest.pack(cfg.basalt.quant) else manifest.estimated_speed_tok_s):.0f} tok/s"),
     )
     print()
     for name, value in rows:
@@ -453,13 +459,25 @@ def interactive_config_wizard(paths: Paths, cfg: Config) -> Config | None:
         return None
     print(f"{paint('Configuration', 'bold')}  {paint('Enter keeps the value in brackets', 'dim')}\n")
     new = cfg.clone()
+    new.basalt.quant = pick("Quant pack", "ud-iq1_m | ud-iq2_xxs | ud-q2_k_xl", cfg.basalt.quant, quant_value)
+    if new.basalt.quant in ("ud-q2_k_xl", "custom"):
+        new.basalt.pack_url = pick(
+            "Pack URL",
+            "https://.../model.basalt",
+            cfg.basalt.pack_url or "",
+            lambda t: t.strip() if re.match(r"^https?://", t.strip()) and "'" not in t else None,
+        )
+    else:
+        new.basalt.pack_url = ""
     new.basalt.max_context = pick("Context/slot", "32K..1M (slot-full-context)", short_context(cfg.basalt.max_context), context_value)
     new.basalt.parallel = int(pick("Parallel", "1-4 concurrent slots", cfg.basalt.parallel, lambda t: int(t) if t.isdigit() and 1 <= int(t) <= 4 else None))
     new.basalt.kv = pick("KV precision", "fp8 (0.97G@1M) or fp16", cfg.basalt.kv, lambda t: t.lower() if t.lower() in ("fp8", "fp16") else None)
     new.basalt.effort = pick("Effort", "1-100, low, high, max (live)", cfg.basalt.effort, effort_value)
     new.colab.idle_min = float(pick("Idle stop", "minutes 1-120 (live)", f"{cfg.colab.idle_min:g}", lambda t: _parse_num(t, 1, 120)))
     new.colab.max_hours = float(pick("Hard stop", "hours 1-24 (live)", f"{cfg.colab.max_hours:g}", lambda t: _parse_num(t, 1, 24)))
-    new.basalt.uncensor = bool(pick("Uncensored", "43KB rank-2 abliterate, y/n", "y" if cfg.basalt.uncensor else "n", _parse_yes_no))
+    new.basalt.uncensor = bool(pick("Uncensored", "43KB mrfakename rank-2, y/n", "y" if cfg.basalt.uncensor else "n", _parse_yes_no))
+    if new.basalt.uncensor:
+        new.basalt.uncensor_scale = float(pick("Uncensor scale", "0.5-2.0 (1.0=std, 1.2=stronger)", f"{cfg.basalt.uncensor_scale:g}", lambda t: _parse_num(t, 0.0, 2.0)))
     new.basalt.ref = pick("Basalt ref", "blank=pinned, or tag/branch", cfg.basalt.ref or "-", lambda t: "" if t in ("-", "pinned", "") else t)
     save_config(new, paths)
     print(f"\n  {paint(glyph('✓', '+'), 'green')} Saved {paint(str(paths.config_file), 'dim')}\n")
@@ -473,18 +491,43 @@ def cmd_setup(paths: Paths, cfg: Config, manifest: Manifest) -> None:
     print(f"Next: {cli_name()} up   (or {cli_name()} console)")
 
 
-def cmd_up(paths: Paths, cfg: Config, manifest: Manifest, wait_gpu: bool, basalt_ref: str | None) -> None:
-    print(paint(f"basalt-colab {__version__} · DeepSeek-V4.1-Flash (Basalt {basalt_ref or cfg.basalt.ref or manifest.basalt_tag})", "bold") + "\n")
-    bal = ensure_setup(paths, cfg, manifest)
-    held = serve_running(paths)
+def cmd_up(
+    paths: Paths,
+    cfg: Config,
+    manifest: Manifest,
+    wait_gpu: bool,
+    basalt_ref: str | None,
+    quant: str | None = None,
+    pack_url: str | None = None,
+    uncensor_scale: float | None = None,
+) -> None:
     want_cfg = cfg.clone()
     if basalt_ref is not None:
         want_cfg.basalt.ref = basalt_ref
+    if quant is not None:
+        q = quant_value(quant)
+        if not q:
+            sys.exit(f"invalid --quant {quant!r} (expected ud-iq1_m, ud-iq2_xxs, ud-q2_k_xl, or custom)")
+        want_cfg.basalt.quant = q
+    if pack_url is not None:
+        want_cfg.basalt.pack_url = pack_url
+    if uncensor_scale is not None:
+        want_cfg.basalt.uncensor_scale = uncensor_scale
+        want_cfg.basalt.uncensor = uncensor_scale > 0.0
+    try:
+        validate_config(want_cfg)
+        want_cfg.boot_vars(manifest=manifest)
+    except ConfigError as e:
+        sys.exit(f"config error: {e}")
+
+    print(paint(f"basalt-colab {__version__} · {want_cfg.basalt.effective_model_alias} (Basalt {want_cfg.basalt.ref or manifest.basalt_tag})", "bold") + "\n")
+    bal = ensure_setup(paths, want_cfg, manifest)
+    held = serve_running(paths)
     if held and held.get("cold_signature") and held["cold_signature"] != want_cfg.cold_signature():
         have = held.get("engine_summary") or "different engine settings"
         sys.exit(f"The endpoint runs with {have}. To change engine settings, stop it first: {cli_name()} down")
-    if bal < cfg.colab.min_balance and not (held and load_session(paths)):
-        sys.exit(f"Colab balance {bal:.2f} compute units is below min_balance {cfg.colab.min_balance:.0f}")
+    if bal < want_cfg.colab.min_balance and not (held and load_session(paths)):
+        sys.exit(f"Colab balance {bal:.2f} compute units is below min_balance {want_cfg.colab.min_balance:.0f}")
     if not held:
         held = ensure_detached_proxy(paths)
     up_opts: dict[str, Any] = {}
@@ -492,7 +535,13 @@ def cmd_up(paths: Paths, cfg: Config, manifest: Manifest, wait_gpu: bool, basalt
         up_opts["wait_gpu"] = True
     if basalt_ref is not None:
         up_opts["basalt_ref"] = basalt_ref
-    conn, r = control_call(paths, cfg, held["port"], "/_control/up", up_opts, 120)
+    if quant is not None:
+        up_opts["quant"] = want_cfg.basalt.quant
+    if pack_url is not None:
+        up_opts["pack_url"] = want_cfg.basalt.pack_url
+    if uncensor_scale is not None:
+        up_opts["uncensor_scale"] = want_cfg.basalt.uncensor_scale
+    conn, r = control_call(paths, want_cfg, held["port"], "/_control/up", up_opts, 120)
     kind, rest = follow(r, paint("Starting a Colab G4 GPU", "bold") + paint(" · ~2-3 minutes (faster with prebuilt binary)", "dim"))
     conn.close()
     if kind != "READY":
@@ -502,7 +551,7 @@ def cmd_up(paths: Paths, cfg: Config, manifest: Manifest, wait_gpu: bool, basalt
     ready_line = f"{glyph('●', '*')} The GPU is already running" if secs < 2 else f"\n{glyph('✓', '+')} Ready after {mmss(secs)}"
     print(paint(ready_line, "bold", "green"))
     endpoint_info(paths, want_cfg, manifest, held["port"], bal)
-    watch_loop(paths, cfg, held["port"])
+    watch_loop(paths, want_cfg, held["port"])
 
 
 def cmd_down(paths: Paths, cfg: Config, manifest: Manifest, everything: bool = False) -> None:
@@ -554,7 +603,7 @@ def cmd_status(paths: Paths, cfg: Config) -> None:
                 ("Console", f"http://{cfg.proxy.host}:{held['port']}/_console"),
                 ("Web UI", f"http://{cfg.proxy.host}:{held['port']}/"),
                 ("Endpoint", f"http://{cfg.proxy.host}:{held['port']}/v1 · {st.get('engine_summary') or ''}"),
-                ("Model", f"{st.get('model') or cfg.basalt.model_alias} (effort {st.get('effort', cfg.basalt.effort)}, ref {st.get('basalt_ref', 'pinned')})"),
+                ("Model", f"{st.get('model') or cfg.basalt.effective_model_alias} (effort {st.get('effort', cfg.basalt.effort)}, {st.get('uncensor', cfg.describe_uncensor())}, ref {st.get('basalt_ref', 'pinned')})"),
                 ("GPU", gpu),
             ]
             perf = format_telemetry(st.get("basalt"))
@@ -705,7 +754,7 @@ def cmd_ask(paths: Paths, cfg: Config, words: list[str]) -> None:
         else prompt
     )
     body: dict[str, Any] = {
-        "model": cfg.basalt.model_alias,
+        "model": cfg.basalt.effective_model_alias,
         "stream": True,
         "stream_options": {"include_usage": True},
         "messages": [{"role": "user", "content": content}],
@@ -759,18 +808,18 @@ def cmd_ask(paths: Paths, cfg: Config, words: list[str]) -> None:
     print()
     if TTY[0]:
         if timings and timings.get("predicted_n"):
-            print(paint(f"{cfg.basalt.model_alias}: {timings['predicted_n']} tokens at {timings.get('predicted_per_second', 0):.1f} tok/s", "dim"))
+            print(paint(f"{cfg.basalt.effective_model_alias}: {timings['predicted_n']} tokens at {timings.get('predicted_per_second', 0):.1f} tok/s", "dim"))
         elif usage_obj and usage_obj.get("completion_tokens") and t_first is not None:
             n = int(usage_obj["completion_tokens"])
             dec_s = max(0.001, t_end - t_first)
             ttft = max(0.0, t_first - t_req)
-            print(paint(f"{cfg.basalt.model_alias}: {n} tokens · TTFT {ttft:.2f}s · {n / dec_s:.1f} tok/s", "dim"))
+            print(paint(f"{cfg.basalt.effective_model_alias}: {n} tokens · TTFT {ttft:.2f}s · {n / dec_s:.1f} tok/s", "dim"))
 
 
 def client_env_vars(paths: Paths, cfg: Config, port: int) -> tuple[tuple[str, str], ...]:
     base = f"http://{cfg.proxy.host}:{port}"
     key = read_api_key(paths)
-    model = cfg.basalt.model_alias
+    model = cfg.basalt.effective_model_alias
     return (
         ("OPENAI_BASE_URL", base + "/v1"),
         ("OPENAI_API_KEY", key),
@@ -917,7 +966,21 @@ def main(argv: list[str] | None = None) -> None:
         elif cmd == "setup":
             cmd_setup(paths, cfg, manifest)
         elif cmd == "up":
-            cmd_up(paths, cfg, manifest, wait_gpu="--wait-gpu" in args[1:], basalt_ref=_extract_flag_val(args[1:], "--basalt-ref"))
+            raw_scale = _extract_flag_val(args[1:], "--uncensor-scale")
+            try:
+                parsed_scale = float(raw_scale) if raw_scale is not None else None
+            except ValueError:
+                sys.exit(f"invalid --uncensor-scale {raw_scale!r} (expected float 0.0-2.0)")
+            cmd_up(
+                paths,
+                cfg,
+                manifest,
+                wait_gpu="--wait-gpu" in args[1:],
+                basalt_ref=_extract_flag_val(args[1:], "--basalt-ref"),
+                quant=_extract_flag_val(args[1:], "--quant"),
+                pack_url=_extract_flag_val(args[1:], "--pack-url"),
+                uncensor_scale=parsed_scale,
+            )
         elif cmd == "down":
             cmd_down(paths, cfg, manifest, everything="--all" in args[1:])
         elif cmd == "status":

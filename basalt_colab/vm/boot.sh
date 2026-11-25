@@ -1,18 +1,21 @@
 #!/bin/bash
-# Cold start on Colab G4 using Basalt v0.5.7 (DeepSeek-V4.1-Flash UD-IQ1_M):
-#   1. Parallel: fetch/build patched Basalt + fetch 139.1 GiB sparse backbone into /mnt/ram + fetch 43 KB abliteration edit
-#   2. In-place abliteration via standalone abliterate (~1.5s, 62/62 tensors)
-#   3. Start basalt serve + POST /load (punch-on-read reclaims ~140 GiB tmpfs in ~12s)
-#   4. Stream 110.6 GB Engram into /mnt/ram/engram.bin (~32s @ 3.2 GB/s)
-#   5. Warmup + open gate.py on :18080 + arm VM-side hard-cap backstop
+# Cold start on Colab G4 using Basalt v0.5.7 (DeepSeek-V4.1-Flash):
+#   1. Inspect 64 KiB .basalt header -> auto-plan storage tier (ram+ram / ram+ssd / ssd+ssd, 0 cold experts on SSD)
+#   2. Parallel: fetch/build patched Basalt + fetch sparse backbone + fetch 43 KB mrfakename abliteration edit
+#   3. In-place abliteration via standalone abliterate (~1.5s, 62/62 tensors, tunable UNCENSOR_SCALE)
+#   4. Start basalt serve + POST /load (punch-on-read reclaims backbone storage before Engram stream)
+#   5. Stream Engram table into /mnt/ram/engram.bin (ram+ram) or /content/engram.bin (ram+ssd / ssd+ssd)
+#   6. Warmup + open gate.py on :18080 + arm VM-side hard-cap backstop
 set -uo pipefail
 : "${CTX:?}"
-export PORT=18081 UNCENSOR=${UNCENSOR:-1} WORKERS=${WORKERS:-64}
+export PORT=18081 UNCENSOR=${UNCENSOR:-1} UNCENSOR_SCALE=${UNCENSOR_SCALE:-1.0} WORKERS=${WORKERS:-64}
 export PARALLEL=${PARALLEL:-2} KV_TYPE=${KV_TYPE:-fp8} VISION_MODE=${VISION_MODE:-dynamic}
 export SPEC_MAX=${SPEC_MAX:-6} DRAFT_EXPERTS=${DRAFT_EXPERTS:-32}
-export VRAM_RESERVE=${VRAM_RESERVE:-700} RAM_BUDGET=${RAM_BUDGET:-55}
+export VRAM_RESERVE=${VRAM_RESERVE:-700} RAM_BUDGET=${RAM_BUDGET:-0}
 export CONV_CACHE_MIB=${CONV_CACHE_MIB:-32768}
+export MODEL_QUANT=${MODEL_QUANT:-ud-iq1_m}
 export MODEL_ALIAS=${MODEL_ALIAS:-DeepSeek-V4.1-Flash-1017-UD-IQ1_M}
+export MODEL_URL=${MODEL_URL:-}
 [ -s /content/secrets/hf_hdr ] && export HF_HDR=/content/secrets/hf_hdr
 R=/content/res; V=/content/vm; D=/content/basalt
 mkdir -p $R /mnt/ram /content/patch $D
@@ -24,33 +27,58 @@ seen() { grep -qE "$1" $R/timeline.txt; }
 hdr() { echo "Authorization: Bearer $(cat /content/secrets/key)"; }
 
 # Read pinned URLs & SHA-256 from $V/manifest.json
-eval "$(python3 - "$V/manifest.json" <<'EOF'
+eval "$(python3 - "$V/manifest.json" "$MODEL_QUANT" <<'EOF'
 import json, shlex, sys
 m = json.load(open(sys.argv[1]))
-for env_k, json_k in (
-    ("ABLIT_URL", "abliteration_url"),
-    ("ABLIT_SHA", "abliteration_sha256"),
-    ("MANIFEST_PREBUILT_URL", "prebuilt_url"),
-    ("MANIFEST_PREBUILT_SHA", "prebuilt_sha256"),
+q = sys.argv[2].strip().lower()
+packs = m.get("packs") or {}
+pack_url = (packs.get(q) or {}).get("url") or (m.get("pack_url", "") if q in ("ud-iq1_m", "iq1_m") else "")
+for env_k, val in (
+    ("ABLIT_URL", m.get("abliteration_url", "")),
+    ("ABLIT_SHA", m.get("abliteration_sha256", "")),
+    ("MANIFEST_PREBUILT_URL", m.get("prebuilt_url", "")),
+    ("MANIFEST_PREBUILT_SHA", m.get("prebuilt_sha256", "")),
+    ("MANIFEST_PACK_URL", pack_url),
 ):
-    print(f"export {env_k}={shlex.quote(str(m.get(json_k, '')))}")
+    print(f"export {env_k}={shlex.quote(str(val))}")
 EOF
 )"
 
-st "boot start engine=basalt model=$MODEL_ALIAS ref=${BASALT_REF:-pinned} ctx=$CTX parallel=$PARALLEL kv=$KV_TYPE vision=$VISION_MODE uncensored=$UNCENSOR"
-RAM_GB=$(( $(awk '/MemTotal/ {print $2}' /proc/meminfo) / 1000000 - 6 ))
-mountpoint -q /mnt/ram || mount -t tmpfs -o size=${RAM_GB}G tmpfs /mnt/ram
-
-if [ "$RAM_GB" -ge 162 ]; then
-  export MODEL_PATH=/mnt/ram/model.basalt
-  export BASALT_PUNCH_FILE=/mnt/ram/model.basalt
-else
-  export MODEL_PATH=/content/model.basalt
-  export BASALT_PUNCH_FILE=""
+[ -n "$MODEL_URL" ] || MODEL_URL="$MANIFEST_PACK_URL"
+if [ -z "$MODEL_URL" ]; then
+  st "MODEL_URL missing for quant=$MODEL_QUANT FAILED"
+  exit 1
 fi
-export ENGRAM_PATH=/mnt/ram/engram.bin
 
-python3 $V/basalt_jobs.py --quant iq1_m \
+st "boot start engine=basalt quant=$MODEL_QUANT model=$MODEL_ALIAS ref=${BASALT_REF:-pinned} ctx=$CTX parallel=$PARALLEL kv=$KV_TYPE vision=$VISION_MODE uncensored=$UNCENSOR scale=$UNCENSOR_SCALE"
+
+RAM_GIB=$(awk '/MemTotal/ {printf "%.1f", $2/1048576}' /proc/meminfo)
+TMPFS_GIB=$(awk '/MemTotal/ {print int($2/1048576) - 6}' /proc/meminfo)
+DISK_FREE_GIB=$(df -BG --output=avail /content | tail -1 | tr -dc '0-9')
+VRAM_GIB=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1 | awk '{printf "%.1f", ($1>0?$1:98304)/1024}')
+VRAM_GIB=${VRAM_GIB:-96.0}
+mountpoint -q /mnt/ram || mount -t tmpfs -o size=${TMPFS_GIB}G tmpfs /mnt/ram
+
+# Inspect remote 64 KiB .basalt header and plan ram+ram / ram+ssd / ssd+ssd (fail-fast if > VM RAM+VRAM)
+PLAN_OUT=$(python3 $V/basalt_jobs.py --plan --quant "$MODEL_QUANT" --url "$MODEL_URL" \
+  --ram-total-gib "$RAM_GIB" --disk-free-gib "$DISK_FREE_GIB" --vram-gib "$VRAM_GIB" \
+  --ram-budget "$RAM_BUDGET" 2> $R/plan_err.txt) || {
+  st "storage plan FAILED ($(tr '\n' ' ' < $R/plan_err.txt))"
+  exit 1
+}
+eval "$PLAN_OUT"
+st "storage plan mode=$STAGE_MODE bb=${BACKBONE_GIB}GiB eng=${ENGRAM_GIB}GiB ram_budget=${RAM_BUDGET}GiB (vm ram=${RAM_GIB}GiB disk=${DISK_FREE_GIB}GiB vram=${VRAM_GIB}GiB)"
+
+# Probe hole-punching on /content before downloading 200+ GiB in ssd+ssd mode
+if [ "$STAGE_MODE" = "ssd+ssd" ]; then
+  python3 $V/basalt_jobs.py --test-punch /content > $R/punch_probe.txt 2>&1 || {
+    st "GUARD: /content does not support FALLOC_FL_PUNCH_HOLE ($(cat $R/punch_probe.txt 2>/dev/null)) FAILED"
+    exit 1
+  }
+  st "punch probe /content ok"
+fi
+
+python3 $V/basalt_jobs.py --quant "$MODEL_QUANT" --url "$MODEL_URL" \
   --backbone-dest "$MODEL_PATH" --backbone-jobs "$R/j_basalt_bb.json" \
   --engram-dest "$ENGRAM_PATH" --engram-jobs "$R/j_basalt_eng.json" \
   --engram-size-out "$R/engram_size.txt" > $R/fetch.log 2>&1 || { st "basalt_jobs FAILED"; exit 1; }
@@ -63,13 +91,14 @@ if [ "$UNCENSOR" = 1 ]; then
     && st "abliteration edit fetched" || st "abliteration edit FAILED"; } &
 fi
 { python3 $V/pfetch.py $R/j_basalt_bb.json --workers $WORKERS --chunk-mb 64 --tag basalt-bb --log $R/fetch.log \
-  && st "backbone fetched (basalt iq1_m)" || st "backbone FAILED"; } &
+  && st "backbone fetched ($MODEL_QUANT -> $MODEL_PATH)" || st "backbone FAILED"; } &
 wait
 seen FAILED && { st "fetch/build FAILED, stopping"; exit 1; }
 
 if [ "$UNCENSOR" = 1 ]; then
   python3 -I $V/abliterate_basalt.py "$MODEL_PATH" /content/patch/abliteration-edit.npz "$D/abliterate" \
-    > $R/patch.log 2>&1 && st "abliteration applied" || { st "abliteration FAILED ($(tail -1 $R/patch.log 2>/dev/null))"; exit 1; }
+    --scale "$UNCENSOR_SCALE" > $R/patch.log 2>&1 \
+    && st "abliteration applied (scale=$UNCENSOR_SCALE)" || { st "abliteration FAILED ($(tail -1 $R/patch.log 2>/dev/null))"; exit 1; }
 fi
 
 # Create 0-block sparse engram.bin so PleReader::open succeeds before Engram download
@@ -83,7 +112,7 @@ for k in $(seq 1 120); do
   sleep 0.5
 done
 
-# Eager weight load (with punch-on-read reclaiming ~140 GiB tmpfs before Engram download)
+# Eager weight load (with punch-on-read reclaiming backbone storage before Engram download)
 curl -sf --max-time 900 -X POST -H "$(hdr)" -H "Content-Type: application/json" -d '{}' \
   http://127.0.0.1:$PORT/load > $R/load.json 2>&1 && st "weights loaded" || { st "weights load FAILED ($(tail -5 $R/server.log 2>/dev/null | tr '\n' ' '))"; exit 1; }
 
@@ -94,13 +123,18 @@ fi
 if [ -n "${BASALT_PUNCH_FILE:-}" ]; then
   python3 $V/basalt_jobs.py --backbone-dest "$MODEL_PATH" --punch-sections dspark/gguf dense > $R/punch.txt 2>&1 || true
 fi
-st "pin: VRAM ${VRAM} MiB, model $(du -sh "$MODEL_PATH" | awk '{print $1}')"
+st "pin: VRAM ${VRAM} MiB, model $(du -sh "$MODEL_PATH" | awk '{print $1}'), mode=$STAGE_MODE"
 
-# Fill 110.6 GB Engram table into /mnt/ram/engram.bin
-( for k in $(seq 1 600); do [ -f $R/READY ] && exit 0; a=$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo)
-    [ "$a" -lt 1200 ] && { for p in $(pgrep -f "[p]fetch.py"); do kill $p; done; st "GUARD: ${a} MiB RAM available, engram fetch stopped FAILED"; exit 0; }; sleep 2; done ) &
+# Fill Engram table (into /mnt/ram/engram.bin for ram+ram, or /content/engram.bin for ram+ssd / ssd+ssd)
+if [ "$STAGE_MODE" = "ram+ram" ]; then
+  ( for k in $(seq 1 600); do [ -f $R/READY ] && exit 0; a=$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo)
+      [ "$a" -lt 1200 ] && { for p in $(pgrep -f "[p]fetch.py"); do kill $p; done; st "GUARD: ${a} MiB RAM available, engram fetch stopped FAILED"; exit 0; }; sleep 2; done ) &
+else
+  DISK_NOW_GIB=$(df -BG --output=avail /content | tail -1 | tr -dc '0-9')
+  st "disk before engram: /content ${DISK_NOW_GIB}GiB free"
+fi
 python3 $V/pfetch.py $R/j_basalt_eng.json --workers $WORKERS --chunk-mb 64 --tag basalt-eng --log $R/fetch.log \
-  && st "engram done" || { st "engram FAILED"; exit 1; }
+  && st "engram done ($ENGRAM_PATH)" || { st "engram FAILED"; exit 1; }
 free -b > $R/free_after_engram.txt
 touch $R/READY
 
